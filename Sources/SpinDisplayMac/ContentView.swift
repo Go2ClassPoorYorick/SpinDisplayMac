@@ -46,6 +46,34 @@ final class DeviceViewModel: ObservableObject {
     @Published var fileEditor: FileEditorState?
     @Published var mediaConversion: MediaConversionState?
     @Published var showMediaImporter = false
+    /// Crop at the start of a preview drag; the drag offsets are applied relative to it.
+    var mediaDragStartCrop: MediaConverter.Crop?
+    @Published var experimentalUnlocked = false
+    @Published var isProjecting = false
+    @Published var isStartingProjection = false
+    @Published var projectionMessage = "Mirrors the center of your main display onto the fan."
+    @Published var projectionFramesSent = 0
+    @Published var projectionFPS = 0.0
+    private var projector: ScreenProjector?
+    private var projectionCounterTimer: Timer?
+    private let projectionCounter = FrameCounter()
+
+    /// Frames sent from the capture queue, read once per second on the main actor.
+    final class FrameCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.withLock { count += 1 } }
+        func take() -> Int { lock.withLock { defer { count = 0 }; return count } }
+    }
+    @Published var pendingExperimentalAction: ExperimentalAction?
+    @Published var isRemoteMatching = false
+
+    enum ExperimentalAction: String, Identifiable {
+        case factoryReset
+        case remotePairing
+        case routerDisconnect
+        var id: String { rawValue }
+    }
 
     final class Cancellation: @unchecked Sendable {
         private let lock = NSLock()
@@ -59,7 +87,8 @@ final class DeviceViewModel: ObservableObject {
         let sourceURL: URL
         let hasSecurityScope: Bool
         let kind: MediaConverter.MediaKind
-        var framing: MediaConverter.Framing = .fill
+        var crop = MediaConverter.Crop()
+        var previewSource: CGImage?
         var includeAudio = true
         var startSecond = 0
         var endSecond: Int?
@@ -158,6 +187,102 @@ final class DeviceViewModel: ObservableObject {
         versionInfo = nil
         fileEditor = nil
         hasLoadedSettings = false
+        isRemoteMatching = false
+        pendingExperimentalAction = nil
+        tearDownProjection()
+    }
+
+    // MARK: - Screen projection
+
+    var projectionUnsupportedReason: String? {
+        if deviceInfo?.restrictions.contains(.projection) == true {
+            return "The device does not support the screen projection function."
+        }
+        // Content type 3 and types 25/26 project LED-transcoded data, which is not implemented.
+        return conversionUnsupportedReason
+    }
+
+    func startProjection() {
+        guard isConnected, let connection else {
+            projectionMessage = "Connect to the fan before projecting."
+            return
+        }
+        if let reason = projectionUnsupportedReason {
+            projectionMessage = reason
+            return
+        }
+        guard !isUploadingFTLV else {
+            projectionMessage = "Wait for the current upload to finish."
+            return
+        }
+        guard !isProjecting, !isStartingProjection else { return }
+        isStartingProjection = true
+        projectionMessage = "Asking the fan to start projection (retrying every 2 s for up to 30 s)…"
+        let connectionID = connection.id
+        let target = conversionTarget
+        connection.startProjection { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.connection?.id == connectionID else { return }
+                switch result {
+                case .failure(let error):
+                    self.isStartingProjection = false
+                    self.projectionMessage = error.localizedDescription
+                case .success:
+                    await self.beginCapture(connection: connection, target: target)
+                }
+            }
+        }
+    }
+
+    private func beginCapture(connection: DeviceConnection, target: MediaConverter.Target) async {
+        let projector = ScreenProjector(imageSize: target.imageSize, maxFPS: target.maxFPS)
+        let counter = projectionCounter
+        _ = counter.take()
+        projector.onFrame = { jpeg in
+            if connection.sendProjectionFrame(jpeg) { counter.increment() }
+        }
+        projector.onStopped = { [weak self] message in
+            Task { @MainActor in self?.stopProjection(message: message) }
+        }
+        do {
+            try await projector.start()
+        } catch {
+            connection.stopProjection()
+            isStartingProjection = false
+            projectionMessage = error.localizedDescription
+            return
+        }
+        self.projector = projector
+        isStartingProjection = false
+        isProjecting = true
+        projectionFramesSent = 0
+        projectionFPS = 0
+        projectionMessage = "Projecting. The fan shows the center square of your main display."
+        projectionCounterTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let frames = self.projectionCounter.take()
+                self.projectionFramesSent += frames
+                self.projectionFPS = Double(frames)
+            }
+        }
+    }
+
+    func stopProjection(message: String = "Projection stopped.") {
+        guard isProjecting || isStartingProjection else { return }
+        tearDownProjection()
+        connection?.stopProjection()
+        projectionMessage = message
+    }
+
+    private func tearDownProjection() {
+        projector?.stop()
+        projector = nil
+        projectionCounterTimer?.invalidate()
+        projectionCounterTimer = nil
+        isProjecting = false
+        isStartingProjection = false
+        projectionFPS = 0
     }
 
     /// Fills the editable settings from the fan once per connection so periodic refreshes don't overwrite edits.
@@ -199,6 +324,14 @@ final class DeviceViewModel: ObservableObject {
             return accepted ? "File changes saved." : "The fan rejected the file changes (status \(status))."
         case SpinDisplayProtocol.deleteFileCommand:
             return accepted ? "The fan accepted the delete request." : "The fan rejected the delete request (status \(status))."
+        case SpinDisplayProtocol.resetCommand:
+            return accepted ? "Factory settings restored successfully." : "The fan rejected the factory reset (status \(status))."
+        case SpinDisplayProtocol.remoteMatchCommand:
+            if status == 2 {
+                isRemoteMatching = false
+                return "Remote control matched."
+            }
+            return accepted ? "Remote pairing started: press any key on the remote." : "Remote pairing response: status \(status)."
         default:
             return "Response 0x\(String(format: "%02X", command)) status \(status)."
         }
@@ -241,6 +374,46 @@ final class DeviceViewModel: ObservableObject {
             try connection.setLoginVerification(isEnabled: loginVerificationEnabled, password: loginPassword)
             connectionMessage = "Login verification command sent."
             loginPassword = ""
+        } catch {
+            connectionMessage = error.localizedDescription
+        }
+    }
+
+    /// Runs an experimental command after its confirmation; each is locked behind `experimentalUnlocked`.
+    func performExperimentalAction(_ action: ExperimentalAction) {
+        guard experimentalUnlocked else {
+            connectionMessage = "Unlock experimental features first."
+            return
+        }
+        guard isConnected, let connection else {
+            connectionMessage = "Connect to the fan first."
+            return
+        }
+        do {
+            switch action {
+            case .factoryReset:
+                try connection.factoryReset()
+                hasLoadedSettings = false
+                connectionMessage = "Factory reset command sent."
+            case .remotePairing:
+                try connection.setRemoteMatching(true)
+                isRemoteMatching = true
+                connectionMessage = "Remote pairing requested. Press any key on the remote."
+            case .routerDisconnect:
+                try connection.disconnectFromRouter(currentSSID: deviceInfo?.routerName ?? "")
+                connectionMessage = "Router disconnect sent. The fan may drop off this network and return to its own hotspot."
+            }
+        } catch {
+            connectionMessage = error.localizedDescription
+        }
+    }
+
+    func cancelRemotePairing() {
+        guard isConnected, let connection else { return }
+        do {
+            try connection.setRemoteMatching(false)
+            isRemoteMatching = false
+            connectionMessage = "Remote pairing cancelled."
         } catch {
             connectionMessage = error.localizedDescription
         }
@@ -511,20 +684,36 @@ final class DeviceViewModel: ObservableObject {
         mediaConversion = nil
     }
 
+    /// Loads the source frame shown in the preview (the frame at the start second for video).
     func refreshMediaPreview() {
         guard let state = mediaConversion else { return }
-        let target = conversionTarget
         Task {
             do {
-                let image = try await MediaConverter.preview(
-                    state.sourceURL, kind: state.kind, target: target, framing: state.framing, startSecond: state.startSecond
-                )
+                let source = try await MediaConverter.sourceFrame(state.sourceURL, kind: state.kind, startSecond: state.startSecond)
                 guard mediaConversion?.id == state.id else { return }
-                mediaConversion?.preview = image
+                mediaConversion?.previewSource = source
+                renderMediaPreview()
             } catch {
                 mediaConversion?.message = error.localizedDescription
             }
         }
+    }
+
+    /// Re-renders the preview locally with the same circle rendering as conversion, at half resolution.
+    func renderMediaPreview() {
+        guard let state = mediaConversion, let source = state.previewSource else { return }
+        let size = max(64, conversionTarget.imageSize / 2)
+        mediaConversion?.preview = try? MediaConverter.render(source, size: size, crop: state.crop)
+    }
+
+    func setMediaCrop(_ crop: MediaConverter.Crop) {
+        guard mediaConversion != nil else { return }
+        var adjusted = crop
+        adjusted.zoom = min(max(adjusted.zoom, MediaConverter.Crop.zoomRange.lowerBound), MediaConverter.Crop.zoomRange.upperBound)
+        adjusted.centerX = min(max(adjusted.centerX, 0), 1)
+        adjusted.centerY = min(max(adjusted.centerY, 0), 1)
+        mediaConversion?.crop = adjusted
+        renderMediaPreview()
     }
 
     /// Converts the selected media, then either uploads it or saves it to `exportURL`.
@@ -553,7 +742,7 @@ final class DeviceViewModel: ObservableObject {
             .appendingPathComponent("SpinDisplayConversion-\(UUID().uuidString)", isDirectory: true)
         let output = directory.appendingPathComponent(uploadName(for: state.sourceURL)).appendingPathExtension("ftlv")
         let options = MediaConverter.Options(
-            framing: state.framing,
+            crop: state.crop,
             includeAudio: state.includeAudio,
             startSecond: state.startSecond,
             endSecond: state.endSecond,
@@ -915,6 +1104,12 @@ final class DeviceViewModel: ObservableObject {
                             self.versionInfo = version
                         }
                     }
+                    connection.onProjectionEnded = { [weak self] message in
+                        Task { @MainActor in
+                            guard let self, self.connection?.id == connectionID else { return }
+                            self.stopProjection(message: message)
+                        }
+                    }
                     connection.onSettingAcknowledged = { [weak self] command, status in
                         Task { @MainActor in
                             guard let self, self.connection?.id == connectionID else { return }
@@ -960,6 +1155,8 @@ struct ContentView: View {
                     .tabItem { Label("Connection", systemImage: "network") }
                 playlistPage
                     .tabItem { Label("Playlist & Control", systemImage: "play.rectangle") }
+                projectionPage
+                    .tabItem { Label("Projection", systemImage: "rectangle.on.rectangle") }
                 wifiPage
                     .tabItem { Label("Wi-Fi", systemImage: "wifi") }
                 configurationPage
@@ -1273,6 +1470,51 @@ struct ContentView: View {
         }
     }
 
+    private var projectionPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if !model.isConnected {
+                disconnectedNotice
+            }
+            GroupBox("Screen projection") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Streams a centered square of your main display (its shorter side, at most 1024 points) to the fan, as the original app did. Frames are \(model.conversionTarget.imageSize)×\(model.conversionTarget.imageSize) JPEGs at quality 30, up to \(model.conversionTarget.maxFPS) fps.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("macOS asks for Screen Recording permission the first time. After allowing it, you may need to quit and reopen the app.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let reason = model.projectionUnsupportedReason {
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    HStack {
+                        if model.isProjecting {
+                            Label("\(Int(model.projectionFPS)) fps  •  \(model.projectionFramesSent) frames", systemImage: "dot.radiowaves.left.and.right")
+                                .monospacedDigit()
+                        } else if model.isStartingProjection {
+                            ProgressView().controlSize(.small)
+                        }
+                        Spacer()
+                        if model.isProjecting || model.isStartingProjection {
+                            Button("Stop projection", role: .destructive) { model.stopProjection() }
+                        } else {
+                            Button("Start projection") { model.startProjection() }
+                                .disabled(!model.isConnected || model.isUploadingFTLV || model.projectionUnsupportedReason != nil)
+                        }
+                    }
+                    Text(model.projectionMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding(.vertical, 4)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 8)
+    }
+
     private var wifiPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             if !model.isConnected {
@@ -1487,11 +1729,85 @@ struct ContentView: View {
                     .padding(.vertical, 4)
                 }
 
-                Text("Not yet exposed: factory reset, remote-control pairing, router disconnect, image/video conversion, screen projection, multi-fan splicing and sync groups, and firmware updates.")
+                experimentalSection
+
+                Text("Firmware updates are not available: the original downloads firmware from the manufacturer's server, and a failed update could leave the fan unusable.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .padding(.vertical, 8)
+        }
+    }
+
+    private var experimentalSection: some View {
+        GroupBox("Experimental — not tested on hardware") {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("I understand these commands are experimental and untested", isOn: $model.experimentalUnlocked)
+                Text("Decoded from the original app but never run on a fan. Each one asks for confirmation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Restore factory settings…", role: .destructive) {
+                        model.pendingExperimentalAction = .factoryReset
+                    }
+                    Button("Disconnect from router…", role: .destructive) {
+                        model.pendingExperimentalAction = .routerDisconnect
+                    }
+                }
+                .disabled(!model.experimentalUnlocked)
+                HStack {
+                    Button("Pair remote control…") { model.pendingExperimentalAction = .remotePairing }
+                        .disabled(model.isRemoteMatching)
+                    Button("Cancel pairing") { model.cancelRemotePairing() }
+                        .disabled(!model.isRemoteMatching)
+                    if model.isRemoteMatching {
+                        ProgressView().controlSize(.small)
+                        Text("Press any key on the remote…").font(.caption)
+                    }
+                }
+                .disabled(!model.experimentalUnlocked)
+            }
+            .disabled(!model.isConnected)
+            .padding(.vertical, 4)
+        }
+        .confirmationDialog(
+            experimentalTitle,
+            isPresented: Binding(
+                get: { model.pendingExperimentalAction != nil },
+                set: { if !$0 { model.pendingExperimentalAction = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Continue", role: .destructive) {
+                if let action = model.pendingExperimentalAction { model.performExperimentalAction(action) }
+                model.pendingExperimentalAction = nil
+            }
+            Button("Cancel", role: .cancel) { model.pendingExperimentalAction = nil }
+        } message: {
+            Text(experimentalMessage)
+        }
+    }
+
+    private var experimentalTitle: String {
+        switch model.pendingExperimentalAction {
+        case .factoryReset: return "Restore factory settings?"
+        case .remotePairing: return "Pair a remote control?"
+        case .routerDisconnect: return "Disconnect the fan from its router?"
+        case nil: return ""
+        }
+    }
+
+    /// Warnings are the original app's own text where it has one.
+    private var experimentalMessage: String {
+        switch model.pendingExperimentalAction {
+        case .factoryReset:
+            return "The original app says this restores the device parameters but does not empty the contents. It may also reset Wi-Fi, which would take the fan off this network."
+        case .remotePairing:
+            return "Press any button on the remote after starting. The original app warns that after a successful match the device can only be controlled through the remote controller."
+        case .routerDisconnect:
+            return "The fan leaves its router and returns to its own hotspot. This Mac will lose the connection until you join the fan's hotspot or configure Wi-Fi again."
+        case nil:
+            return ""
         }
     }
 
@@ -1752,12 +2068,39 @@ private struct MediaConversionSheet: View {
                         Text(describe(state.kind))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Picker("Framing", selection: binding(\.framing)) {
+                        Picker("Framing", selection: Binding(
+                            get: { state.crop.framing },
+                            set: { model.setMediaCrop(MediaConverter.Crop(framing: $0)) }
+                        )) {
                             Text("Fill circle").tag(MediaConverter.Framing.fill)
                             Text("Fit whole image").tag(MediaConverter.Framing.fit)
                         }
                         .pickerStyle(.segmented)
-                        .onChange(of: state.framing) { _ in model.refreshMediaPreview() }
+                        HStack {
+                            Text("Zoom")
+                            Slider(
+                                value: Binding(
+                                    get: { state.crop.zoom },
+                                    set: { zoom in
+                                        var crop = model.mediaConversion?.crop ?? state.crop
+                                        crop.zoom = zoom
+                                        model.setMediaCrop(crop)
+                                    }
+                                ),
+                                in: MediaConverter.Crop.zoomRange
+                            )
+                            Text(String(format: "%.1f×", state.crop.zoom))
+                                .monospacedDigit()
+                                .frame(width: 36, alignment: .trailing)
+                        }
+                        HStack {
+                            Text("Drag the preview to move the circle.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Reset") { model.setMediaCrop(MediaConverter.Crop(framing: state.crop.framing)) }
+                                .controlSize(.small)
+                        }
                         if case .video(let duration, _, let hasAudio) = state.kind {
                             let last = MediaConverter.availableSeconds(duration: duration, holdLastFrame: state.holdLastFrame)
                             Stepper(value: binding(\.startSecond), in: 0...(last - 1)) {
@@ -1825,6 +2168,8 @@ private struct MediaConversionSheet: View {
         return "Frames: \(target.imageSize)×\(target.imageSize) JPEG, up to \(target.maxFPS) fps (\(source)). Still images show for 10 s per loop."
     }
 
+    private static let previewSize: CGFloat = 220
+
     private func preview(_ state: DeviceViewModel.MediaConversionState) -> some View {
         ZStack {
             Circle().fill(Color.black)
@@ -1837,7 +2182,25 @@ private struct MediaConversionSheet: View {
                 ProgressView()
             }
         }
-        .frame(width: 220, height: 220)
+        .frame(width: Self.previewSize, height: Self.previewSize)
+        .contentShape(Circle())
+        .gesture(
+            DragGesture()
+                .onChanged { value in
+                    let start = model.mediaDragStartCrop ?? state.crop
+                    if model.mediaDragStartCrop == nil { model.mediaDragStartCrop = start }
+                    guard let source = state.previewSource else { return }
+                    // Dragging moves the image under the circle, so the crop center moves the other way.
+                    let side = MediaConverter.cropRect(width: source.width, height: source.height, crop: start).width
+                    let pointsToPixels = side / Self.previewSize
+                    var crop = start
+                    crop.centerX = start.centerX - Double(value.translation.width * pointsToPixels) / Double(source.width)
+                    crop.centerY = start.centerY - Double(value.translation.height * pointsToPixels) / Double(source.height)
+                    model.setMediaCrop(crop)
+                }
+                .onEnded { _ in model.mediaDragStartCrop = nil }
+        )
+        .help("Drag to position the circle over the image.")
     }
 
     private func describe(_ kind: MediaConverter.MediaKind) -> String {

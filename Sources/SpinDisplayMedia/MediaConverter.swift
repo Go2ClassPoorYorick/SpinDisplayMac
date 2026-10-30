@@ -16,6 +16,25 @@ public enum MediaConverter {
         public var id: String { rawValue }
     }
 
+    /// Where the fan's circle sits over the source, like dragging and zooming the original's circle.
+    /// `framing` sets the base circle (shorter side for fill, longer side for fit); `zoom` > 1 shrinks it
+    /// to show less; the center is a fraction of the source width and height from its top-left corner.
+    public struct Crop: Equatable, Sendable {
+        public var framing: Framing
+        public var zoom: Double
+        public var centerX: Double
+        public var centerY: Double
+
+        public init(framing: Framing = .fill, zoom: Double = 1, centerX: Double = 0.5, centerY: Double = 0.5) {
+            self.framing = framing
+            self.zoom = zoom
+            self.centerX = centerX
+            self.centerY = centerY
+        }
+
+        public static let zoomRange: ClosedRange<Double> = 0.5...6
+    }
+
     public enum MediaKind: Equatable, Sendable {
         case image
         case animatedImage(frameCount: Int, duration: Double)
@@ -35,7 +54,7 @@ public enum MediaConverter {
     }
 
     public struct Options: Sendable {
-        public var framing: Framing = .fill
+        public var crop = Crop()
         public var includeAudio = true
         public var startSecond = 0
         public var endSecond: Int?
@@ -44,13 +63,13 @@ public enum MediaConverter {
         public var holdLastFrame = true
 
         public init(
-            framing: Framing = .fill,
+            crop: Crop = Crop(),
             includeAudio: Bool = true,
             startSecond: Int = 0,
             endSecond: Int? = nil,
             holdLastFrame: Bool = true
         ) {
-            self.framing = framing
+            self.crop = crop
             self.includeAudio = includeAudio
             self.startSecond = startSecond
             self.endSecond = endSecond
@@ -120,20 +139,19 @@ public enum MediaConverter {
         return .video(duration: duration, sourceFPS: Double(fps), hasAudio: hasAudio)
     }
 
-    /// Renders the first frame for preview, using the same pipeline as conversion.
-    public static func preview(_ url: URL, kind: MediaKind, target: Target, framing: Framing, startSecond: Int) async throws -> CGImage {
+    /// The unrendered source frame used for previews (the first frame, or the video frame at `startSecond`).
+    public static func sourceFrame(_ url: URL, kind: MediaKind, startSecond: Int) async throws -> CGImage {
         switch kind {
         case .image, .animatedImage:
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
                   let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw ConversionError.unreadable
             }
-            return try render(image, size: target.imageSize, framing: framing)
+            return image
         case .video:
             let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
             generator.appliesPreferredTrackTransform = true
-            let image = try await generator.image(at: CMTime(seconds: Double(startSecond), preferredTimescale: 600)).image
-            return try render(image, size: target.imageSize, framing: framing)
+            return try await generator.image(at: CMTime(seconds: Double(startSecond), preferredTimescale: 600)).image
         }
     }
 
@@ -153,7 +171,7 @@ public enum MediaConverter {
                 throw ConversionError.unreadable
             }
             let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: FTLVWriter.stillImageFrameDuration)
-            try writer.appendVideoFrame(try jpeg(render(image, size: target.imageSize, framing: options.framing)),
+            try writer.appendVideoFrame(try jpeg(render(image, size: target.imageSize, crop: options.crop)),
                                         duration: FTLVWriter.stillImageFrameDuration)
             try writer.finish()
             progress(1, "Image converted.")
@@ -225,7 +243,7 @@ public enum MediaConverter {
             let sourceIndex = max(0, (starts.lastIndex { $0 <= time } ?? 0))
             if sourceIndex != cachedIndex {
                 guard let image = CGImageSourceCreateImageAtIndex(source, sourceIndex, nil) else { throw ConversionError.unreadable }
-                cachedJPEG = try jpeg(render(image, size: target.imageSize, framing: options.framing))
+                cachedJPEG = try jpeg(render(image, size: target.imageSize, crop: options.crop))
                 cachedIndex = sourceIndex
             }
             try writer.appendVideoFrame(cachedJPEG, duration: frameDuration)
@@ -289,7 +307,7 @@ public enum MediaConverter {
         func emitCurrent() throws {
             guard var frame = current else { return }
             if frame.jpeg == nil {
-                frame.jpeg = try jpeg(render(frame.image, size: target.imageSize, framing: options.framing))
+                frame.jpeg = try jpeg(render(frame.image, size: target.imageSize, crop: options.crop))
                 current = frame
             }
             try writer.appendVideoFrame(frame.jpeg!, duration: frameDuration)
@@ -399,7 +417,20 @@ public enum MediaConverter {
         return CGRect(x: (w - side) / 2, y: (h - side) / 2, width: side, height: side)
     }
 
+    /// The square region (top-left origin, source pixels) that maps onto the fan's circle.
+    public static func cropRect(width: Int, height: Int, crop: Crop) -> CGRect {
+        let w = CGFloat(width), h = CGFloat(height)
+        let base = crop.framing == .fill ? min(w, h) : max(w, h)
+        let zoom = min(max(crop.zoom, Crop.zoomRange.lowerBound), Crop.zoomRange.upperBound)
+        let side = base / CGFloat(zoom)
+        return CGRect(x: CGFloat(crop.centerX) * w - side / 2, y: CGFloat(crop.centerY) * h - side / 2, width: side, height: side)
+    }
+
     public static func render(_ image: CGImage, size: Int, framing: Framing) throws -> CGImage {
+        try render(image, size: size, crop: Crop(framing: framing))
+    }
+
+    public static func render(_ image: CGImage, size: Int, crop cropSettings: Crop) throws -> CGImage {
         guard let context = CGContext(
             data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -414,14 +445,15 @@ public enum MediaConverter {
         context.addEllipse(in: CGRect(x: -9, y: -9, width: side + 18, height: side + 18))
         context.clip()
 
-        let crop = cropSquare(width: image.width, height: image.height, framing: framing)
+        let crop = cropRect(width: image.width, height: image.height, crop: cropSettings)
         let scale = side / crop.width
-        // CoreGraphics has a bottom-left origin; the crop rectangle is symmetric, so centering is identical.
+        // CoreGraphics has a bottom-left origin: place the image so the crop's top edge meets the frame's top.
+        let drawnHeight = CGFloat(image.height) * scale
         context.draw(image, in: CGRect(
             x: -crop.minX * scale,
-            y: -crop.minY * scale,
+            y: side + crop.minY * scale - drawnHeight,
             width: CGFloat(image.width) * scale,
-            height: CGFloat(image.height) * scale
+            height: drawnHeight
         ))
         guard let result = context.makeImage() else { throw ConversionError.encodingFailed }
         return result

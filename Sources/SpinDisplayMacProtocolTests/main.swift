@@ -387,6 +387,23 @@ enum SpinDisplayProtocolTests {
         precondition(SpinDisplayProtocol.loginVerificationRequest(isEnabled: true, password: "") == nil)
         precondition(SpinDisplayProtocol.loginVerificationRequest(isEnabled: true, password: "123456789") == nil)
 
+        // Original Send.Reset(false) = 0x55; Send.MatchCode(0/1); Send.LanChange(0, name, password).
+        let reset = SpinDisplayProtocol.factoryResetRequest()
+        assertFrame(reset, command: 0x19, payloadLength: 1)
+        precondition(reset[4] == 0x55 && SpinDisplayProtocol.factoryResetRequest(clearContent: true)[4] == 0x58)
+        assertFrame(SpinDisplayProtocol.remoteMatchRequest(start: true), command: 0x22, payloadLength: 1)
+        precondition(SpinDisplayProtocol.remoteMatchRequest(start: true)[4] == 0 && SpinDisplayProtocol.remoteMatchRequest(start: false)[4] == 1)
+        let leave = SpinDisplayProtocol.routerDisconnectRequest(currentSSID: "Home")
+        assertFrame(leave, command: 0x07, payloadLength: 99)
+        precondition(leave[4] == 0 && Array(leave[5..<9]) == Array("Home".utf8) && leave[9..<103].allSatisfy { $0 == 0 })
+
+        // Original Send.Projection(1/0) and ProjectionSend's FA + 3-byte little-endian length prefix.
+        let projectionOn = SpinDisplayProtocol.projectionRequest(isOn: true)
+        assertFrame(projectionOn, command: 0x37, payloadLength: 1)
+        precondition(projectionOn[4] == 1 && SpinDisplayProtocol.projectionRequest(isOn: false)[4] == 0)
+        precondition(SpinDisplayProtocol.projectionFrameHeader(length: 0x012345) == [0xfa, 0x45, 0x23, 0x01])
+        precondition(SpinDisplayProtocol.projectionFrameHeader(length: 1 << 24) == nil)
+
         let deleteAll = SpinDisplayProtocol.deleteAllFilesRequest()
         assertFrame(deleteAll, command: 0x32, payloadLength: 2)
         precondition(Array(deleteAll[4..<6]) == [1, 0])
@@ -546,6 +563,12 @@ enum SpinDisplayProtocolTests {
         precondition(fill == CGRect(x: 420, y: 0, width: 1080, height: 1080))
         let fit = MediaConverter.cropSquare(width: 1920, height: 1080, framing: .fit)
         precondition(fit == CGRect(x: 0, y: -420, width: 1920, height: 1920))
+        // Crop: default equals the original fill; zoom shrinks the circle; center is a top-left fraction.
+        precondition(MediaConverter.cropRect(width: 1920, height: 1080, crop: .init()) == fill)
+        precondition(MediaConverter.cropRect(width: 1920, height: 1080, crop: .init(framing: .fit)) == fit)
+        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: .init(zoom: 2, centerX: 0.25, centerY: 0.25))
+            == CGRect(x: 50, y: 0, width: 100, height: 100))
+        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: .init(zoom: 100)).width == 200 / 6)
         precondition(MediaConverter.unsupportedReason(deviceType: 25, contentType: 0) != nil)
         precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 3) != nil)
         precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 1) == nil)
@@ -611,5 +634,29 @@ enum SpinDisplayProtocolTests {
             }
         }
         precondition(Double(totalError) / Double(samples) < 12, "JPEG round-trip error too high")
+
+        // Projection frames: 4:2:0 at quality 30 (2×2 luma sampling in SOF0), still decodable by ImageIO.
+        let subsampled = [UInt8](BaselineJPEGEncoder.encode(rgba: pixels, width: width, height: height, quality: 30, subsampling: .s420))
+        let subsampledSOF = subsampled.indices.first { subsampled[$0] == 0xff && subsampled[$0 + 1] == 0xc0 }!
+        precondition(Array(subsampled[(subsampledSOF + 10)..<(subsampledSOF + 19)]) == [1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1])
+        guard let subsampledSource = CGImageSourceCreateWithData(Data(subsampled) as CFData, nil),
+              let subsampledImage = CGImageSourceCreateImageAtIndex(subsampledSource, 0, nil),
+              subsampledImage.width == width, subsampledImage.height == height else {
+            preconditionFailure("4:2:0 JPEG did not decode")
+        }
+        var subsampledPixels = [UInt8](repeating: 0, count: width * height * 4)
+        subsampledPixels.withUnsafeMutableBytes { buffer in
+            let context = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                    bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            context.draw(subsampledImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        var gradientError = 0
+        for pixel in 0..<(width * height) {
+            for channel in 0..<2 {  // red and green are smooth gradients; blue is a checkerboard lost to 4:2:0
+                gradientError += abs(Int(pixels[pixel * 4 + channel]) - Int(subsampledPixels[pixel * 4 + channel]))
+            }
+        }
+        precondition(Double(gradientError) / Double(width * height * 2) < 40, "4:2:0 round-trip error too high")
     }
 }

@@ -11,6 +11,8 @@ final class DeviceConnection {
     var onDeviceInfoChanged: ((FanDeviceInfo) -> Void)?
     var onVersionChanged: ((FanVersionInfo) -> Void)?
     var onSettingAcknowledged: ((UInt8, UInt8) -> Void)?
+    /// Called when an active projection ends without `stopProjection()` (send failure or the fan stopping it).
+    var onProjectionEnded: ((String) -> Void)?
     var onDisconnected: ((String) -> Void)?
 
     let id = UUID()
@@ -25,6 +27,12 @@ final class DeviceConnection {
     private var uploadWaitStage: UploadWaitStage?
     private var uploadResponse: UInt8?
     private var uploadSocket: Int32?
+    private let projectionCondition = NSCondition()
+    private let projectionQueue = DispatchQueue(label: "SpinDisplay.projection")
+    private var projectionSocket: Int32?
+    private var projectionStarting = false
+    private var projectionResponse: UInt8?
+    private var projectionFrameInFlight = false
 
     private init(socketDescriptor: Int32, address: String) {
         self.socketDescriptor = socketDescriptor
@@ -75,6 +83,7 @@ final class DeviceConnection {
         socketDescriptor = -1
         stateLock.unlock()
         cancelPendingUpload()
+        closeProjectionSocket()
         _ = shutdown(descriptor, SHUT_RDWR)
         _ = close(descriptor)
     }
@@ -230,6 +239,144 @@ final class DeviceConnection {
 
     func deleteAllFiles() throws {
         try sendPacket(SpinDisplayProtocol.deleteAllFilesRequest())
+    }
+
+    func factoryReset() throws {
+        try sendPacket(SpinDisplayProtocol.factoryResetRequest())
+    }
+
+    func setRemoteMatching(_ start: Bool) throws {
+        try sendPacket(SpinDisplayProtocol.remoteMatchRequest(start: start))
+    }
+
+    func disconnectFromRouter(currentSSID: String) throws {
+        try sendPacket(SpinDisplayProtocol.routerDisconnectRequest(currentSSID: currentSSID))
+    }
+
+    // MARK: - Screen projection (original `TcpServer.StartProjection` / `ProjectionSend` / `CancelProjection`)
+
+    func startProjection(completion: @escaping (Result<Void, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                try performStartProjection()
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    /// Queues one JPEG frame. Returns false (dropping the frame) when not projecting or still sending the last one.
+    @discardableResult
+    func sendProjectionFrame(_ jpeg: Data) -> Bool {
+        guard let header = SpinDisplayProtocol.projectionFrameHeader(length: jpeg.count) else { return false }
+        projectionCondition.lock()
+        guard let socket = projectionSocket, !projectionFrameInFlight else {
+            projectionCondition.unlock()
+            return false
+        }
+        projectionFrameInFlight = true
+        projectionCondition.unlock()
+        projectionQueue.async { [self] in
+            var packet = Data(header)
+            packet.append(jpeg)
+            do {
+                try Self.sendData(packet, on: socket)
+            } catch {
+                endProjection(notify: "Projection stopped: \(error.localizedDescription)")
+            }
+            projectionCondition.lock()
+            projectionFrameInFlight = false
+            projectionCondition.unlock()
+        }
+        return true
+    }
+
+    func stopProjection() {
+        guard closeProjectionSocket() else { return }
+        try? sendPacket(SpinDisplayProtocol.projectionRequest(isOn: false))
+    }
+
+    private func performStartProjection() throws {
+        uploadCondition.lock()
+        let uploading = uploadWaitStage != nil || uploadSocket != nil
+        uploadCondition.unlock()
+        guard !uploading else { throw ConnectionError.uploadInProgress }
+
+        projectionCondition.lock()
+        guard projectionSocket == nil, !projectionStarting else {
+            projectionCondition.unlock()
+            throw ConnectionError.projectionInProgress
+        }
+        projectionStarting = true
+        projectionResponse = nil
+        projectionCondition.unlock()
+
+        var socket: Int32?
+        defer {
+            projectionCondition.lock()
+            projectionStarting = false
+            projectionCondition.unlock()
+        }
+        do {
+            socket = try openDataSocket()
+            // The original repeats the request every 2 s until the fan answers 0; any other status only
+            // means "not ready yet" (it never gives up while connected). Retry for up to 30 s here.
+            let deadline = Date().addingTimeInterval(30)
+            var lastStatus: UInt8?
+            while Date() < deadline {
+                try sendPacket(SpinDisplayProtocol.projectionRequest(isOn: true))
+                projectionCondition.lock()
+                let wait = Date().addingTimeInterval(2)
+                while projectionResponse == nil, Date() < wait {
+                    _ = projectionCondition.wait(until: wait)
+                }
+                let response = projectionResponse
+                projectionResponse = nil
+                projectionCondition.unlock()
+
+                stateLock.lock()
+                let isClosed = closed
+                stateLock.unlock()
+                guard !isClosed else { throw ConnectionError.disconnected }
+
+                guard let response else { continue }
+                guard response == 0 else {
+                    lastStatus = response
+                    continue
+                }
+                projectionCondition.lock()
+                projectionSocket = socket
+                projectionCondition.unlock()
+                return
+            }
+            if let lastStatus { throw ConnectionError.projectionRejected(status: lastStatus) }
+            throw ConnectionError.projectionTimedOut
+        } catch {
+            if let socket {
+                _ = shutdown(socket, SHUT_RDWR)
+                _ = close(socket)
+            }
+            throw error
+        }
+    }
+
+    /// Closes the projection data socket; returns false if no projection was active.
+    @discardableResult
+    private func closeProjectionSocket() -> Bool {
+        projectionCondition.lock()
+        let socket = projectionSocket
+        projectionSocket = nil
+        projectionCondition.unlock()
+        guard let socket else { return false }
+        _ = shutdown(socket, SHUT_RDWR)
+        _ = close(socket)
+        return true
+    }
+
+    private func endProjection(notify message: String) {
+        guard closeProjectionSocket() else { return }
+        onProjectionEnded?(message)
     }
 
     func refreshDeviceInfo() throws {
@@ -453,6 +600,7 @@ final class DeviceConnection {
         stateLock.unlock()
 
         cancelPendingUpload()
+        closeProjectionSocket()
         _ = shutdown(descriptor, SHUT_RDWR)
         _ = close(descriptor)
         onDisconnected?(message)
@@ -491,6 +639,19 @@ final class DeviceConnection {
             onPowerChanged?(info.isOn)
             onBrightnessChanged?(info.brightness)
             onDeviceInfoChanged?(info)
+        case SpinDisplayProtocol.projectionCommand where frame.count >= 7:
+            let status = frame[4]
+            projectionCondition.lock()
+            let starting = projectionStarting
+            if starting {
+                projectionResponse = status
+                projectionCondition.signal()
+            }
+            projectionCondition.unlock()
+            // Like the original, any non-zero status while projecting ends the projection.
+            if !starting, status != 0 {
+                endProjection(notify: "The fan ended projection (status \(status)).")
+            }
         case SpinDisplayProtocol.versionCommand:
             if let version = SpinDisplayProtocol.parseVersion(frame) {
                 onVersionChanged?(version)
@@ -499,7 +660,9 @@ final class DeviceConnection {
              SpinDisplayProtocol.thirdPartyControlCommand,
              SpinDisplayProtocol.loginVerificationCommand,
              SpinDisplayProtocol.changeFileCommand,
-             SpinDisplayProtocol.deleteFileCommand:
+             SpinDisplayProtocol.deleteFileCommand,
+             SpinDisplayProtocol.resetCommand,
+             SpinDisplayProtocol.remoteMatchCommand:
             if let status = SpinDisplayProtocol.parseSettingStatus(frame, command: frame[1]) {
                 onSettingAcknowledged?(frame[1], status)
             }
@@ -721,6 +884,10 @@ final class DeviceConnection {
     private func beginUpload(_ descriptor: Int32) throws {
         uploadCondition.lock()
         defer { uploadCondition.unlock() }
+        projectionCondition.lock()
+        let projecting = projectionSocket != nil || projectionStarting
+        projectionCondition.unlock()
+        guard !projecting else { throw ConnectionError.projectionInProgress }
         guard uploadWaitStage == nil else { throw ConnectionError.uploadInProgress }
         uploadWaitStage = .waitingForReady
         uploadResponse = nil
@@ -837,6 +1004,9 @@ final class DeviceConnection {
         case fileTransferTimedOut
         case fileChangedDuringUpload
         case uploadInProgress
+        case projectionInProgress
+        case projectionRejected(status: UInt8)
+        case projectionTimedOut
 
         var errorDescription: String? {
             switch self {
@@ -879,6 +1049,12 @@ final class DeviceConnection {
                 return "The FTLV file changed while it was being uploaded."
             case .uploadInProgress:
                 return "A media upload is already in progress."
+            case .projectionInProgress:
+                return "Projection is already running."
+            case .projectionRejected(let status):
+                return "The fan kept answering status \(status) for 30 seconds and never accepted projection. It may not support projection, or another session may be using it."
+            case .projectionTimedOut:
+                return "The fan did not answer the projection request within 30 seconds."
             }
         }
     }

@@ -253,8 +253,10 @@ public enum SpinDisplayProtocol {
     public static let deviceNameCommand: UInt8 = 0x16
     public static let powerCommand: UInt8 = 0x17
     public static let angleCommand: UInt8 = 0x18
+    public static let resetCommand: UInt8 = 0x19
     public static let scheduleCommand: UInt8 = 0x20
     public static let clockCommand: UInt8 = 0x21
+    public static let remoteMatchCommand: UInt8 = 0x22
     public static let bleVolumeCommand: UInt8 = 0x23
     public static let displayModeCommand: UInt8 = 0x24
     public static let fileSendCommand: UInt8 = 0x30
@@ -264,6 +266,9 @@ public enum SpinDisplayProtocol {
     public static let changeFileCommand: UInt8 = 0x34
     public static let playControlCommand: UInt8 = 0x35
     public static let fileHeaderSendCommand: UInt8 = 0x36
+    public static let projectionCommand: UInt8 = 0x37
+    /// Marker byte that starts each projection frame on the data channel (`Protocol.ProHeader`).
+    public static let projectionFrameMarker: UInt8 = 0xfa
 
     public static func frame(command: UInt8, payload: [UInt8] = []) -> [UInt8] {
         precondition(payload.count <= Int(UInt16.max))
@@ -309,6 +314,39 @@ public enum SpinDisplayProtocol {
         payload.append(contentsOf: repeatElement(0, count: 64 - passwordBytes.count))
         payload.append(0)
         return frame(command: wifiConfigurationCommand, payload: payload)
+    }
+
+    /// Original `Send.LanChange(0, …)`: leave the router and return to the fan's own hotspot.
+    /// The original sends whatever the network fields contain; this sends the current router name only.
+    public static func routerDisconnectRequest(currentSSID: String) -> [UInt8] {
+        let ssidBytes = Array(currentSSID.utf8.prefix(32))
+        var payload: [UInt8] = [0]
+        payload.append(contentsOf: ssidBytes)
+        payload.append(contentsOf: repeatElement(0, count: 32 - ssidBytes.count))
+        payload.append(contentsOf: repeatElement(0, count: 1 + 64 + 1))
+        return frame(command: wifiConfigurationCommand, payload: payload)
+    }
+
+    /// Original `Send.Reset(bool)`: 0x55 restores parameters and keeps content (the Settings button);
+    /// 0x58 is the unused "clear" variant.
+    public static func factoryResetRequest(clearContent: Bool = false) -> [UInt8] {
+        frame(command: resetCommand, payload: [clearContent ? 0x58 : 0x55])
+    }
+
+    /// Original `Send.MatchCode`: 0 starts remote-control pairing, 1 cancels it. The fan answers 2 when matched.
+    public static func remoteMatchRequest(start: Bool) -> [UInt8] {
+        frame(command: remoteMatchCommand, payload: [start ? 0 : 1])
+    }
+
+    /// Original `Send.Projection`: 1 asks the fan to accept live frames on the data channel, 0 ends projection.
+    public static func projectionRequest(isOn: Bool) -> [UInt8] {
+        frame(command: projectionCommand, payload: [isOn ? 1 : 0])
+    }
+
+    /// Original `TcpServer.ProjectionSend`: `FA` and a 3-byte little-endian length precede each JPEG frame.
+    public static func projectionFrameHeader(length: Int) -> [UInt8]? {
+        guard (0..<(1 << 24)).contains(length) else { return nil }
+        return [projectionFrameMarker, UInt8(length & 0xff), UInt8((length >> 8) & 0xff), UInt8((length >> 16) & 0xff)]
     }
 
     public static func powerRequest(isOn: Bool) -> [UInt8] {

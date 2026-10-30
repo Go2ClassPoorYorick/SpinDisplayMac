@@ -1,55 +1,97 @@
 import Foundation
 
 /// A minimal baseline JPEG encoder that produces the same stream structure as the original client's
-/// libjpeg-turbo call (`tjCompress(…, TJSAMP_444, quality 80, flags 0)`):
-/// SOI, JFIF APP0, two quantization tables, SOF0 with 1×1 sampling for Y/Cb/Cr, the standard
+/// libjpeg-turbo calls (`tjCompress(…, TJSAMP_444, quality 80, flags 0)` for uploads and
+/// `TJSAMP_420`, quality 30 for projection): SOI, JFIF APP0, two quantization tables, SOF0, the standard
 /// Huffman tables, one interleaved scan without restart markers, EOI.
 ///
 /// ImageIO instead writes 4:2:0 data with Exif/Photoshop segments and a restart interval, which
 /// small embedded decoders may not accept.
 public enum BaselineJPEGEncoder {
+    public enum Subsampling: Sendable {
+        /// Full-resolution chroma, used by the original for uploaded media (`TJSAMP_444`).
+        case s444
+        /// 2×2 chroma averaging, used by the original for screen projection (`TJSAMP_420`).
+        case s420
+
+        var factor: Int { self == .s444 ? 1 : 2 }
+    }
+
     /// Encodes tightly packed RGBA (or RGBX) pixels; alpha is ignored.
-    public static func encode(rgba: [UInt8], width: Int, height: Int, quality: Int = 80) -> Data {
+    public static func encode(rgba: [UInt8], width: Int, height: Int, quality: Int = 80, subsampling: Subsampling = .s444) -> Data {
         precondition(width > 0 && height > 0 && rgba.count >= width * height * 4)
         let luminanceTable = scaledTable(standardLuminance, quality: quality)
         let chrominanceTable = scaledTable(standardChrominance, quality: quality)
+        let factor = subsampling.factor
 
         var output = Data()
         output.reserveCapacity(width * height / 2)
-        writeHeaders(into: &output, width: width, height: height, luminance: luminanceTable, chrominance: chrominanceTable)
+        writeHeaders(into: &output, width: width, height: height, luminance: luminanceTable,
+                     chrominance: chrominanceTable, lumaSampling: UInt8(factor << 4 | factor))
+
+        // JFIF / libjpeg RGB → YCbCr planes, level-shifted by 128 for the DCT.
+        let count = width * height
+        var lumaPlane = [Float](repeating: 0, count: count)
+        var blueChroma = [Float](repeating: 0, count: count)
+        var redChroma = [Float](repeating: 0, count: count)
+        rgba.withUnsafeBufferPointer { pixels in
+            for index in 0..<count {
+                let r = Float(pixels[index * 4]), g = Float(pixels[index * 4 + 1]), b = Float(pixels[index * 4 + 2])
+                lumaPlane[index] = 0.299 * r + 0.587 * g + 0.114 * b - 128
+                blueChroma[index] = -0.168_735_89 * r - 0.331_264_11 * g + 0.5 * b
+                redChroma[index] = 0.5 * r - 0.418_687_59 * g - 0.081_312_41 * b
+            }
+        }
 
         let luminanceDivisors = luminanceTable.map { Float($0) }
         let chrominanceDivisors = chrominanceTable.map { Float($0) }
         var writer = BitWriter()
         var previousDC = [0, 0, 0]
-        var y = [Float](repeating: 0, count: 64)
-        var cb = [Float](repeating: 0, count: 64)
-        var cr = [Float](repeating: 0, count: 64)
+        var block = [Float](repeating: 0, count: 64)
         var coefficients = [Int](repeating: 0, count: 64)
+        let mcuSize = 8 * factor
 
-        rgba.withUnsafeBufferPointer { pixels in
-            for blockY in stride(from: 0, to: height, by: 8) {
-                for blockX in stride(from: 0, to: width, by: 8) {
-                    for row in 0..<8 {
-                        let sourceY = min(blockY + row, height - 1)
-                        for column in 0..<8 {
-                            let sourceX = min(blockX + column, width - 1)
-                            let offset = (sourceY * width + sourceX) * 4
-                            let r = Float(pixels[offset]), g = Float(pixels[offset + 1]), b = Float(pixels[offset + 2])
-                            let index = row * 8 + column
-                            // JFIF / libjpeg RGB → YCbCr, level-shifted by 128 for the DCT.
-                            y[index] = 0.299 * r + 0.587 * g + 0.114 * b - 128
-                            cb[index] = -0.168_735_89 * r - 0.331_264_11 * g + 0.5 * b
-                            cr[index] = 0.5 * r - 0.418_687_59 * g - 0.081_312_41 * b
+        func fillLuma(x originX: Int, y originY: Int) {
+            for row in 0..<8 {
+                let sourceY = min(originY + row, height - 1)
+                for column in 0..<8 {
+                    block[row * 8 + column] = lumaPlane[sourceY * width + min(originX + column, width - 1)]
+                }
+            }
+        }
+
+        // Each chroma sample averages a factor × factor pixel area (edges repeat the last pixel).
+        func fillChroma(_ plane: [Float], x originX: Int, y originY: Int) {
+            let weight = 1 / Float(factor * factor)
+            for row in 0..<8 {
+                for column in 0..<8 {
+                    var sum: Float = 0
+                    for dy in 0..<factor {
+                        let sourceY = min(originY + row * factor + dy, height - 1)
+                        for dx in 0..<factor {
+                            sum += plane[sourceY * width + min(originX + column * factor + dx, width - 1)]
                         }
                     }
-                    transformAndQuantize(y, divisors: luminanceDivisors, into: &coefficients)
-                    encodeBlock(coefficients, previousDC: &previousDC[0], dc: dcLuminance, ac: acLuminance, writer: &writer)
-                    transformAndQuantize(cb, divisors: chrominanceDivisors, into: &coefficients)
-                    encodeBlock(coefficients, previousDC: &previousDC[1], dc: dcChrominance, ac: acChrominance, writer: &writer)
-                    transformAndQuantize(cr, divisors: chrominanceDivisors, into: &coefficients)
-                    encodeBlock(coefficients, previousDC: &previousDC[2], dc: dcChrominance, ac: acChrominance, writer: &writer)
+                    block[row * 8 + column] = sum * weight
                 }
+            }
+        }
+
+        for mcuY in stride(from: 0, to: height, by: mcuSize) {
+            for mcuX in stride(from: 0, to: width, by: mcuSize) {
+                for blockRow in 0..<factor {
+                    for blockColumn in 0..<factor {
+                        fillLuma(x: mcuX + blockColumn * 8, y: mcuY + blockRow * 8)
+                        transformAndQuantize(block, divisors: luminanceDivisors, into: &coefficients)
+                        encodeBlock(coefficients, previousDC: &previousDC[0], dc: dcLuminance, ac: acLuminance, writer: &writer)
+                    }
+                }
+                fillChroma(blueChroma, x: mcuX, y: mcuY)
+                transformAndQuantize(block, divisors: chrominanceDivisors, into: &coefficients)
+                encodeBlock(coefficients, previousDC: &previousDC[1], dc: dcChrominance, ac: acChrominance, writer: &writer)
+                fillChroma(redChroma, x: mcuX, y: mcuY)
+                transformAndQuantize(block, divisors: chrominanceDivisors, into: &coefficients)
+                encodeBlock(coefficients, previousDC: &previousDC[2], dc: dcChrominance, ac: acChrominance, writer: &writer)
             }
         }
         writer.flush()
@@ -161,7 +203,9 @@ public enum BaselineJPEGEncoder {
 
     // MARK: - Headers
 
-    private static func writeHeaders(into output: inout Data, width: Int, height: Int, luminance: [Int], chrominance: [Int]) {
+    private static func writeHeaders(
+        into output: inout Data, width: Int, height: Int, luminance: [Int], chrominance: [Int], lumaSampling: UInt8
+    ) {
         output.append(contentsOf: [0xff, 0xd8])
         // APP0 JFIF 1.01, no density units, 1:1 aspect, no thumbnail (as libjpeg writes it).
         output.append(contentsOf: [0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00])
@@ -172,7 +216,7 @@ public enum BaselineJPEGEncoder {
         output.append(contentsOf: [
             0xff, 0xc0, 0x00, 0x11, 0x08,
             UInt8(height >> 8), UInt8(height & 0xff), UInt8(width >> 8), UInt8(width & 0xff),
-            0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01
+            0x03, 0x01, lumaSampling, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01
         ])
         for (classAndID, spec) in [(0x00, dcLuminance), (0x10, acLuminance), (0x01, dcChrominance), (0x11, acChrominance)] {
             let length = 2 + 1 + 16 + spec.values.count

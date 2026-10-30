@@ -4,7 +4,7 @@ import SpinDisplayMedia
 
 // Offline converter and inspector for FTLV files. It never contacts a fan.
 //
-//   SpinDisplayConvertCLI convert <input> <output.ftlv> [--size N] [--max-fps N] [--fit] [--no-audio]
+//   SpinDisplayConvertCLI convert <input> <output.ftlv> [--size N] [--max-fps N] [--fit] [--zoom Z] [--center-x X] [--center-y Y] [--no-audio]
 //                                 [--start S] [--end S] [--trim]
 //   SpinDisplayConvertCLI inspect <file.ftlv> [--extract-frames DIR]
 
@@ -54,7 +54,12 @@ case "convert":
         maxFPS: Int(value(after: "--max-fps", in: arguments) ?? "") ?? 20
     )
     let options = MediaConverter.Options(
-        framing: arguments.contains("--fit") ? .fit : .fill,
+        crop: MediaConverter.Crop(
+            framing: arguments.contains("--fit") ? .fit : .fill,
+            zoom: Double(value(after: "--zoom", in: arguments) ?? "") ?? 1,
+            centerX: Double(value(after: "--center-x", in: arguments) ?? "") ?? 0.5,
+            centerY: Double(value(after: "--center-y", in: arguments) ?? "") ?? 0.5
+        ),
         includeAudio: !arguments.contains("--no-audio"),
         startSecond: Int(value(after: "--start", in: arguments) ?? "") ?? 0,
         endSecond: Int(value(after: "--end", in: arguments) ?? ""),
