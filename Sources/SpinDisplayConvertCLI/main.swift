@@ -5,7 +5,7 @@ import SpinDisplayMedia
 // Offline converter and inspector for FTLV files. It never contacts a fan.
 //
 //   SpinDisplayConvertCLI convert <input> <output.ftlv> [--size N] [--max-fps N] [--fit] [--zoom Z] [--center-x X] [--center-y Y] [--no-audio]
-//                                 [--start S] [--end S] [--trim]
+//                                 [--start S] [--end S] [--trim] [--mold-type 25|26]
 //   SpinDisplayConvertCLI inspect <file.ftlv> [--extract-frames DIR]
 
 func fail(_ message: String) -> Never {
@@ -49,10 +49,15 @@ case "convert":
     guard arguments.count >= 3 else { fail("usage: convert <input> <output.ftlv> [options]") }
     let input = URL(fileURLWithPath: arguments[1])
     let output = URL(fileURLWithPath: arguments[2])
-    let target = MediaConverter.Target(
+    var target = MediaConverter.Target(
         imageSize: Int(value(after: "--size", in: arguments) ?? "") ?? 672,
         maxFPS: Int(value(after: "--max-fps", in: arguments) ?? "") ?? 20
     )
+    // --mold-type 25|26: the original Export window's mold-encoded presets.
+    if let type = UInt8(value(after: "--mold-type", in: arguments) ?? "") {
+        guard let mold = MoldTranscoder.exportPreset(deviceType: type, imageWidth: 672) else { fail("--mold-type must be 25 or 26") }
+        target = MediaConverter.Target(imageSize: 672, maxFPS: target.maxFPS, encoding: .mold(mold, deviceType: type))
+    }
     let options = MediaConverter.Options(
         crop: MediaConverter.Crop(
             framing: arguments.contains("--fit") ? .fit : .fill,

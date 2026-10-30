@@ -24,15 +24,18 @@ final class ScreenProjector: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private let imageSize: Int
     private let maxFPS: Int
+    /// Content-type-3 fans receive mold JPEGs (original `JpgBinTool.toBin`, quality 90).
+    private let mold: MoldTranscoder?
     private let sampleQueue = DispatchQueue(label: "SpinDisplay.projection.capture")
     private let stateLock = NSLock()
     private var stream: SCStream?
     private var source: ProjectionSource?
     private var lastPreview = Date.distantPast
 
-    init(imageSize: Int, maxFPS: Int) {
+    init(imageSize: Int, maxFPS: Int, mold: MoldTranscoder? = nil) {
         self.imageSize = imageSize
         self.maxFPS = max(1, maxFPS)
+        self.mold = mold
     }
 
     /// The original captures this square of the primary screen: its shorter side, capped at 1024.
@@ -145,7 +148,11 @@ final class ScreenProjector: NSObject, SCStreamOutput, SCStreamDelegate {
             frame = captured
         }
         guard let rgba = Self.rgbaPixels(of: frame) else { return }
-        onFrame?(BaselineJPEGEncoder.encode(rgba: rgba, width: frame.width, height: frame.height, quality: 30, subsampling: .s420))
+        if let mold {
+            onFrame?(mold.jpeg(rgba: rgba, width: frame.width, height: frame.height, quality: 90))
+        } else {
+            onFrame?(BaselineJPEGEncoder.encode(rgba: rgba, width: frame.width, height: frame.height, quality: 30, subsampling: .s420))
+        }
         if Date().timeIntervalSince(lastPreview) > 0.25 {
             lastPreview = Date()
             onPreview?(frame)

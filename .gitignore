@@ -2,3 +2,6 @@
 .DS_Store
 dist/
 project.md
+
+# Manufacturer manual from the original app: copyrighted, keep it local (build-app.sh bundles it if present).
+Resources/help.pdf

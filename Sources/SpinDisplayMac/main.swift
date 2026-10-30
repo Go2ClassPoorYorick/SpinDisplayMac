@@ -9,6 +9,20 @@ struct SpinDisplayMacApp: App {
         WindowGroup {
             ContentView()
         }
+        .commands {
+            CommandGroup(replacing: .help) {
+                // The original app shipped a manufacturer manual (help.pdf). It is copyrighted, so it is only
+                // bundled from a local copy; otherwise this opens the manufacturer's SpinDisplay page.
+                Button("SpinDisplay Manual") {
+                    if let url = Bundle.main.url(forResource: "help", withExtension: "pdf") {
+                        NSWorkspace.shared.open(url)
+                    } else if let url = URL(string: "https://www.ftlled.com/spindisplay") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
+        }
     }
 }
 

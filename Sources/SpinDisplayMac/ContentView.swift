@@ -38,7 +38,30 @@ final class DeviceViewModel: ObservableObject {
     @Published var ftlvUploadMessage = ""
     @Published var deviceInfo: FanDeviceInfo?
     @Published var versionInfo: FanVersionInfo?
+    @Published var transcoding: FanTranscoding?
+    @Published var binConfiguration: FanBinConfiguration?
+    /// Frame encoding for this fan's content type, rebuilt when its parameters arrive.
+    private var fanEncoding: MediaConverter.FrameEncoding = .standard
+    @Published var rotationSpeedRPM: Int?
+    @Published var isLampTestActive = false
+    @Published var firmwareCandidate: FirmwareCandidate?
+    @Published var allowFirmwareModelMismatch = false
+    @Published var isUpdatingFirmware = false
+    @Published var firmwareProgress = 0.0
+    @Published var firmwareMessage = ""
+
+    struct FirmwareCandidate: Identifiable {
+        let url: URL
+        let package: FirmwarePackageInfo
+        var id: URL { url }
+    }
+    @Published var rawCommandText = "68 11 00 00"
+    @Published var consoleLines: [String] = []
+    @Published var consoleHidesRoutine = true
+    @Published var isMeasuringSpeed = false
     @Published var displayMode: FanDisplayMode = .highlight
+    @Published var syncGroup = 0
+    @Published var isSyncHost = false
     @Published var thirdPartyControlEnabled = false
     @Published var loginVerificationEnabled = false
     @Published var loginPassword = ""
@@ -46,6 +69,7 @@ final class DeviceViewModel: ObservableObject {
     @Published var fileEditor: FileEditorState?
     @Published var mediaConversion: MediaConversionState?
     @Published var showMediaImporter = false
+    let fleet = FleetModel()
     /// Crop at the start of a preview drag; the drag offsets are applied relative to it.
     var mediaDragStartCrop: MediaConverter.Crop?
     @Published var experimentalUnlocked = false
@@ -90,6 +114,46 @@ final class DeviceViewModel: ObservableObject {
     @Published var pendingExperimentalAction: ExperimentalAction?
     @Published var isRemoteMatching = false
 
+    /// Export targets, following the original Export window (generic, device types 25 and 26).
+    enum ExportFormat: String, CaseIterable, Identifiable {
+        case fan
+        case generic
+        case type25
+        case type26
+        var id: String { rawValue }
+    }
+
+    /// The export choices available now: "This fan" only when the fan uses an FTLV-compatible format.
+    var availableExportFormats: [ExportFormat] {
+        var formats: [ExportFormat] = [.generic, .type25, .type26]
+        if case .mold = fanEncoding { formats.insert(.fan, at: 0) }
+        return formats
+    }
+
+    func exportFormatLabel(_ format: ExportFormat) -> String {
+        switch format {
+        case .fan: return "This fan (type \(connectedDevice?.deviceType ?? 0))"
+        case .generic: return "Generic"
+        case .type25: return "Device type 25"
+        case .type26: return "Device type 26"
+        }
+    }
+
+    private func exportTarget(_ format: ExportFormat) -> MediaConverter.Target {
+        let base = conversionTarget
+        switch format {
+        case .fan:
+            return base
+        case .generic:
+            return MediaConverter.Target(imageSize: base.imageSize, maxFPS: base.maxFPS)
+        case .type25, .type26:
+            let deviceType: UInt8 = format == .type25 ? 25 : 26
+            // The original Export window uses 672-pixel frames and fixed mold presets for these types.
+            let mold = MoldTranscoder.exportPreset(deviceType: deviceType, imageWidth: 672)!
+            return MediaConverter.Target(imageSize: 672, maxFPS: base.maxFPS, encoding: .mold(mold, deviceType: deviceType))
+        }
+    }
+
     enum ExperimentalAction: String, Identifiable {
         case factoryReset
         case remotePairing
@@ -115,6 +179,7 @@ final class DeviceViewModel: ObservableObject {
         var startSecond = 0
         var endSecond: Int?
         var holdLastFrame = true
+        var exportFormat: ExportFormat = .fan
         var preview: CGImage?
         var isWorking = false
         var progress = 0.0
@@ -218,6 +283,12 @@ final class DeviceViewModel: ObservableObject {
         isUploadingFTLV = false
         deviceInfo = nil
         versionInfo = nil
+        rotationSpeedRPM = nil
+        isMeasuringSpeed = false
+        transcoding = nil
+        binConfiguration = nil
+        fanEncoding = .standard
+        isLampTestActive = false
         fileEditor = nil
         hasLoadedSettings = false
         isRemoteMatching = false
@@ -231,8 +302,12 @@ final class DeviceViewModel: ObservableObject {
         if deviceInfo?.restrictions.contains(.projection) == true {
             return "The device does not support the screen projection function."
         }
-        // Content type 3 and types 25/26 project LED-transcoded data, which is not implemented.
-        return conversionUnsupportedReason
+        // Content-type-3 fans project mold JPEGs, which need their transcoding parameters; the original
+        // projects plain JPEGs to every other content type.
+        if deviceInfo?.contentType == 3, transcoding == nil {
+            return "Waiting for this fan's LED transcoding parameters (content type 3)…"
+        }
+        return nil
     }
 
     /// Lists displays and windows (this also triggers the Screen Recording prompt the first time).
@@ -397,7 +472,9 @@ final class DeviceViewModel: ObservableObject {
     }
 
     private func beginCapture(connection: DeviceConnection, target: MediaConverter.Target) async {
-        let projector = ScreenProjector(imageSize: target.imageSize, maxFPS: target.maxFPS)
+        var mold: MoldTranscoder?
+        if case .mold(let transcoder, _) = target.encoding { mold = transcoder }
+        let projector = ScreenProjector(imageSize: target.imageSize, maxFPS: target.maxFPS, mold: mold)
         let counter = projectionCounter
         _ = counter.take()
         projector.onFrame = { jpeg in
@@ -459,9 +536,14 @@ final class DeviceViewModel: ObservableObject {
 
     /// Fills the editable settings from the fan once per connection so periodic refreshes don't overwrite edits.
     private func applyDeviceInfo(_ info: FanDeviceInfo) {
+        let imageSizeChanged = deviceInfo?.imageSize != info.imageSize
         deviceInfo = info
+        if imageSizeChanged { rebuildFanEncoding() }
         guard !hasLoadedSettings else { return }
         hasLoadedSettings = true
+        // The original queries transcoding at connect for content type 3 and bin parameters for type 1.
+        if info.contentType == 3 { try? connection?.requestTranscoding() }
+        if info.contentType == 1 { try? connection?.requestBinConfiguration() }
         if !info.deviceName.isEmpty { configuredDeviceName = info.deviceName }
         fanAngleDegrees = Double(max(-360, min(360, info.angleDegrees)))
         autoPowerOn = info.isAutoOn
@@ -477,6 +559,8 @@ final class DeviceViewModel: ObservableObject {
         bluetoothVolume = Double(info.volume)
         bluetoothMessage = "Bluetooth audio is \(info.isBluetoothEnabled ? "enabled" : "disabled") on the fan (volume \(info.volume)/31)."
         displayMode = FanDisplayMode(rawValue: info.displayMode) ?? .highlight
+        syncGroup = Int(info.groupNumber)
+        isSyncHost = info.syncFlag == 1
         thirdPartyControlEnabled = info.isThirdPartyControlEnabled
         loginVerificationEnabled = info.isLoginVerificationEnabled
     }
@@ -496,6 +580,12 @@ final class DeviceViewModel: ObservableObject {
             return accepted ? "File changes saved." : "The fan rejected the file changes (status \(status))."
         case SpinDisplayProtocol.deleteFileCommand:
             return accepted ? "The fan accepted the delete request." : "The fan rejected the delete request (status \(status))."
+        case SpinDisplayProtocol.syncGroupCommand:
+            return accepted ? "Sync group saved." : "The fan rejected the sync group (status \(status))."
+        case SpinDisplayProtocol.setCoordinateCommand:
+            return accepted ? "Splicing position saved." : "The fan rejected the splicing position (status \(status))."
+        case SpinDisplayProtocol.jointModeCommand:
+            return accepted ? "Splicing mode changed." : "The fan rejected the splicing mode (status \(status))."
         case SpinDisplayProtocol.resetCommand:
             return accepted ? "Factory settings restored successfully." : "The fan rejected the factory reset (status \(status))."
         case SpinDisplayProtocol.remoteMatchCommand:
@@ -506,6 +596,20 @@ final class DeviceViewModel: ObservableObject {
             return accepted ? "Remote pairing started: press any key on the remote." : "Remote pairing response: status \(status)."
         default:
             return "Response 0x\(String(format: "%02X", command)) status \(status)."
+        }
+    }
+
+    /// Original Settings "Sync Group": group 0–20 and "Set as host (a sync group can only have one host)".
+    func applySyncGroup() {
+        guard isConnected, let connection else {
+            connectionMessage = "Connect to the fan before changing its sync group."
+            return
+        }
+        do {
+            try connection.setSyncGroup(syncGroup, isHost: isSyncHost)
+            connectionMessage = "Sync group command sent."
+        } catch {
+            connectionMessage = error.localizedDescription
         }
     }
 
@@ -586,6 +690,174 @@ final class DeviceViewModel: ObservableObject {
             try connection.setRemoteMatching(false)
             isRemoteMatching = false
             connectionMessage = "Remote pairing cancelled."
+        } catch {
+            connectionMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Factory test tools (original TestWindow)
+
+    func toggleLampTest() {
+        guard experimentalUnlocked, isConnected, let connection else { return }
+        let turnOn = !isLampTestActive
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try connection.setLampTest(turnOn) }
+            Task { @MainActor in
+                switch result {
+                case .success:
+                    self.isLampTestActive = turnOn
+                    self.connectionMessage = "Lamp test \(turnOn ? "started" : "ended") (the fan was powered off first, as the original does)."
+                case .failure(let error):
+                    self.connectionMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Original Test Picture: four solid frames (red, green, blue, white), 2 seconds each.
+    func uploadTestPicture() {
+        guard experimentalUnlocked else { return }
+        let size = conversionTarget.imageSize
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SpinDisplayTestPicture-\(UUID().uuidString)", isDirectory: true)
+        let output = directory.appendingPathComponent(uploadName(for: URL(fileURLWithPath: "Test picture.ftlv")))
+            .appendingPathExtension("ftlv")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: 2_000_000)
+            for color: [UInt8] in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]] {
+                var pixels = [UInt8](repeating: 255, count: size * size * 4)
+                for pixel in 0..<(size * size) {
+                    pixels[pixel * 4] = color[0]
+                    pixels[pixel * 4 + 1] = color[1]
+                    pixels[pixel * 4 + 2] = color[2]
+                }
+                try writer.appendVideoFrame(BaselineJPEGEncoder.encode(rgba: pixels, width: size, height: size), duration: 2_000_000)
+            }
+            try writer.finish()
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            connectionMessage = error.localizedDescription
+            return
+        }
+        startUpload(of: output, validatingMessage: "Uploading the test picture…") {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    // MARK: - Firmware update from a local .POVC package
+
+    static func firmwareVersionText(_ version: Int) -> String {
+        String(format: "%.2f", Double(version) / 100)
+    }
+
+    func chooseFirmwarePackage() {
+        guard experimentalUnlocked else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose a firmware package (.POVC)"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let header = [UInt8](try handle.read(upToCount: FirmwarePackageInfo.headerLength) ?? Data())
+            let length = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+            guard let package = FirmwarePackageInfo.parse(header: header, fileLength: length) else {
+                firmwareMessage = "\(url.lastPathComponent) is not a firmware package (.POVC files start with byte FF)."
+                return
+            }
+            allowFirmwareModelMismatch = false
+            firmwareCandidate = FirmwareCandidate(url: url, package: package)
+        } catch {
+            firmwareMessage = error.localizedDescription
+        }
+    }
+
+    /// Why the candidate cannot be flashed as-is, following the original's automatic-update rule.
+    var firmwareBlockReason: String? {
+        guard let candidate = firmwareCandidate else { return nil }
+        guard isConnected, connectedDevice != nil else { return "Connect to a discovered fan first." }
+        guard let version = versionInfo else { return "The fan's version has not been read yet." }
+        if candidate.package.model != Int(version.model), !allowFirmwareModelMismatch {
+            return "This package is for model \(candidate.package.model), but the fan reports model \(version.model)."
+        }
+        if isUploadingFTLV || isProjecting { return "Wait for the current upload or projection to finish." }
+        return nil
+    }
+
+    func startFirmwareUpdate() {
+        guard experimentalUnlocked, let candidate = firmwareCandidate, firmwareBlockReason == nil,
+              let connection, !isUpdatingFirmware else { return }
+        firmwareCandidate = nil
+        isUpdatingFirmware = true
+        firmwareProgress = 0
+        firmwareMessage = "Starting the firmware update…"
+        let connectionID = connection.id
+        connection.updateFirmware(
+            at: candidate.url,
+            progress: { [weak self] progress, message in
+                Task { @MainActor in
+                    guard let self, self.connection?.id == connectionID else { return }
+                    self.firmwareProgress = progress
+                    self.firmwareMessage = message
+                }
+            },
+            completion: { [weak self] result in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.isUpdatingFirmware = false
+                    switch result {
+                    case .success:
+                        self.firmwareProgress = 1
+                        self.firmwareMessage = "Upgrade successful. The fan may restart; reconnect to confirm the new version."
+                    case .failure(let error):
+                        self.firmwareMessage = error.localizedDescription
+                    }
+                }
+            }
+        )
+    }
+
+    func sendRawCommand() {
+        guard experimentalUnlocked, isConnected, let connection else { return }
+        guard let packet = SpinDisplayProtocol.rawPacket(hex: rawCommandText) else {
+            appendConsole("! Enter hex bytes starting with 68, command, and 2-byte length (the CRC is added).")
+            return
+        }
+        do {
+            try connection.sendRawPacket(packet)
+            appendConsole("→ " + Self.hex(packet))
+        } catch {
+            appendConsole("! " + error.localizedDescription)
+        }
+    }
+
+    func appendConsole(_ line: String) {
+        consoleLines.append(line)
+        if consoleLines.count > 200 { consoleLines.removeFirst(consoleLines.count - 200) }
+    }
+
+    static func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    /// Read-only query from the original factory Test window's Speed button.
+    func measureRotationSpeed() {
+        guard isConnected, let connection else {
+            connectionMessage = "Connect to the fan before measuring its speed."
+            return
+        }
+        do {
+            try connection.requestRotationSpeed()
+            isMeasuringSpeed = true
+            Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if isMeasuringSpeed {
+                    isMeasuringSpeed = false
+                    connectionMessage = "The fan did not answer the speed query."
+                }
+            }
         } catch {
             connectionMessage = error.localizedDescription
         }
@@ -761,8 +1033,31 @@ final class DeviceViewModel: ObservableObject {
             return
         }
         let hasSecurityScope = url.startAccessingSecurityScopedResource()
-        startUpload(of: url, validatingMessage: "Validating FTLV file…") {
-            if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+        guard isBinFan else {
+            startUpload(of: url, validatingMessage: "Validating FTLV file…") {
+                if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+            }
+            return
+        }
+        // Like the original SendFTLVBinWork, re-encode the FTLV's frames as bin frames first.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SpinDisplayBin-\(UUID().uuidString)", isDirectory: true)
+        let output = directory.appendingPathComponent(url.deletingPathExtension().lastPathComponent).appendingPathExtension("ftlv")
+        let target = conversionTarget
+        ftlvUploadMessage = "Converting the FTLV frames for this fan…"
+        Task {
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try await Task.detached { try MediaConverter.rebinFTLV(url, target: target, output: output) }.value
+                if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+                startUpload(of: output, validatingMessage: "Uploading…") {
+                    try? FileManager.default.removeItem(at: directory)
+                }
+            } catch {
+                if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+                try? FileManager.default.removeItem(at: directory)
+                ftlvUploadMessage = error.localizedDescription
+            }
         }
     }
 
@@ -788,17 +1083,14 @@ final class DeviceViewModel: ObservableObject {
         ftlvUploadProgress = 0
         ftlvUploadMessage = validatingMessage
         let connectionID = connection.id
-        connection.uploadFTLV(
-            at: url,
-            deviceType: device.deviceType,
-            progress: { [weak self] progress, message in
-                Task { @MainActor in
-                    guard let self, self.connection?.id == connectionID else { return }
-                    self.ftlvUploadProgress = progress
-                    self.ftlvUploadMessage = message
-                }
-            },
-            completion: { [weak self] result in
+        let progress: (Double, String) -> Void = { [weak self] progress, message in
+            Task { @MainActor in
+                guard let self, self.connection?.id == connectionID else { return }
+                self.ftlvUploadProgress = progress
+                self.ftlvUploadMessage = message
+            }
+        }
+        let completion: (Result<Void, Error>) -> Void = { [weak self] result in
                 Task { @MainActor in
                     cleanup()
                     guard let self, self.connection?.id == connectionID else { return }
@@ -811,8 +1103,19 @@ final class DeviceViewModel: ObservableObject {
                         self.ftlvUploadMessage = error.localizedDescription
                     }
                 }
-            }
-        )
+        }
+        if isBinFan {
+            // Content-type-1 fans take bin frames over the 0x38 protocol instead of an FTLV file.
+            connection.uploadBin(
+                container: url,
+                name: url.deletingPathExtension().lastPathComponent,
+                voiceDisabled: deviceInfo?.restrictions.contains(.voice) == true,
+                progress: progress,
+                completion: completion
+            )
+        } else {
+            connection.uploadFTLV(at: url, deviceType: device.deviceType, progress: progress, completion: completion)
+        }
         return true
     }
 
@@ -820,11 +1123,37 @@ final class DeviceViewModel: ObservableObject {
 
     var conversionTarget: MediaConverter.Target {
         guard let info = deviceInfo else { return .generic }
-        return MediaConverter.Target(imageSize: info.imageSize, maxFPS: info.maxFPS)
+        return MediaConverter.Target(imageSize: info.imageSize, maxFPS: info.maxFPS, encoding: fanEncoding)
     }
 
     var conversionUnsupportedReason: String? {
-        MediaConverter.unsupportedReason(deviceType: connectedDevice?.deviceType, contentType: deviceInfo?.contentType)
+        MediaConverter.unsupportedReason(
+            contentType: deviceInfo?.contentType,
+            hasTranscoding: transcoding != nil,
+            hasBinConfiguration: binConfiguration != nil
+        )
+    }
+
+    var isBinFan: Bool {
+        if case .bin = fanEncoding { return true }
+        return false
+    }
+
+    /// Builds the encoder for the fan's content type: mold JPEG (3), bin bit planes (1), or plain JPEG.
+    private func rebuildFanEncoding() {
+        let imageSize = deviceInfo?.imageSize ?? MediaConverter.Target.generic.imageSize
+        switch deviceInfo?.contentType {
+        case 3?:
+            if let transcoding, let device = connectedDevice {
+                fanEncoding = .mold(MoldTranscoder(transcoding: transcoding, imageWidth: imageSize), deviceType: device.deviceType)
+            } else {
+                fanEncoding = .standard
+            }
+        case 1?:
+            fanEncoding = binConfiguration.map { .bin(BinTranscoder(configuration: $0, imageWidth: imageSize)) } ?? .standard
+        default:
+            fanEncoding = .standard
+        }
     }
 
     func chooseMedia(from result: Result<URL, Error>) {
@@ -839,7 +1168,8 @@ final class DeviceViewModel: ObservableObject {
         Task {
             do {
                 let kind = try await MediaConverter.inspect(url)
-                let state = MediaConversionState(sourceURL: url, hasSecurityScope: hasSecurityScope, kind: kind)
+                var state = MediaConversionState(sourceURL: url, hasSecurityScope: hasSecurityScope, kind: kind)
+                state.exportFormat = availableExportFormats.first ?? .generic
                 mediaConversion = state
                 refreshMediaPreview()
             } catch {
@@ -891,7 +1221,8 @@ final class DeviceViewModel: ObservableObject {
     /// Converts the selected media, then either uploads it or saves it to `exportURL`.
     func runMediaConversion(exportTo exportURL: URL? = nil) {
         guard var state = mediaConversion, !state.isWorking else { return }
-        if let reason = conversionUnsupportedReason {
+        if !availableExportFormats.contains(state.exportFormat) { state.exportFormat = .generic }
+        if exportURL == nil || state.exportFormat == .fan, let reason = conversionUnsupportedReason {
             mediaConversion?.message = reason
             return
         }
@@ -920,7 +1251,7 @@ final class DeviceViewModel: ObservableObject {
             endSecond: state.endSecond,
             holdLastFrame: state.holdLastFrame
         )
-        let target = conversionTarget
+        let target = exportURL == nil ? conversionTarget : exportTarget(state.exportFormat)
         let cancellation = state.cancellation
         let id = state.id
         let report: @Sendable (Double, String) -> Void = { [weak self] progress, message in
@@ -1276,6 +1607,35 @@ final class DeviceViewModel: ObservableObject {
                             self.versionInfo = version
                         }
                     }
+                    connection.onRawFrame = { [weak self] frame in
+                        Task { @MainActor in
+                            guard let self, self.connection?.id == connectionID else { return }
+                            // Heartbeat, playback status, and parameter refreshes arrive every few seconds.
+                            if self.consoleHidesRoutine, [0x14, 0x35, 0x12].contains(frame[1]) { return }
+                            self.appendConsole("← " + Self.hex(frame))
+                        }
+                    }
+                    connection.onTranscoding = { [weak self] transcoding in
+                        Task { @MainActor in
+                            guard let self, self.connection?.id == connectionID else { return }
+                            self.transcoding = transcoding
+                            self.rebuildFanEncoding()
+                        }
+                    }
+                    connection.onBinConfiguration = { [weak self] configuration in
+                        Task { @MainActor in
+                            guard let self, self.connection?.id == connectionID else { return }
+                            self.binConfiguration = configuration
+                            self.rebuildFanEncoding()
+                        }
+                    }
+                    connection.onRotationSpeed = { [weak self] value in
+                        Task { @MainActor in
+                            guard let self, self.connection?.id == connectionID else { return }
+                            self.rotationSpeedRPM = value
+                            self.isMeasuringSpeed = false
+                        }
+                    }
                     connection.onProjectionEnded = { [weak self] message in
                         Task { @MainActor in
                             guard let self, self.connection?.id == connectionID else { return }
@@ -1329,6 +1689,8 @@ struct ContentView: View {
                     .tabItem { Label("Playlist & Control", systemImage: "play.rectangle") }
                 projectionPage
                     .tabItem { Label("Projection", systemImage: "rectangle.on.rectangle") }
+                FleetView(fleet: model.fleet, model: model)
+                    .tabItem { Label("Group", systemImage: "square.grid.2x2") }
                 wifiPage
                     .tabItem { Label("Wi-Fi", systemImage: "wifi") }
                 configurationPage
@@ -1366,6 +1728,9 @@ struct ContentView: View {
         }
         .sheet(item: $model.mediaConversion) { _ in
             MediaConversionSheet(model: model)
+        }
+        .sheet(item: $model.firmwareCandidate) { candidate in
+            FirmwareConfirmationSheet(model: model, candidate: candidate)
         }
         .confirmationDialog(
             "Delete all files on this fan?",
@@ -1979,6 +2344,27 @@ struct ContentView: View {
                     .padding(.vertical, 4)
                 }
 
+                GroupBox("Sync group") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Picker("Group", selection: $model.syncGroup) {
+                                Text("Ungrouped").tag(0)
+                                ForEach(1...20, id: \.self) { Text("Sync group \($0)").tag($0) }
+                            }
+                            .frame(maxWidth: 240)
+                            Toggle("Set as host", isOn: $model.isSyncHost)
+                                .disabled(model.syncGroup == 0)
+                            Spacer()
+                            Button("Apply group") { model.applySyncGroup() }
+                                .disabled(!model.isConnected || model.deviceInfo?.restrictions.contains(.sync) == true)
+                        }
+                        Text("Fans in the same group play in sync; a group can only have one host. Bluetooth audio is only available on the host of a group.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+
                 GroupBox("Display mode") {
                     HStack {
                         Picker("Display mode", selection: $model.displayMode) {
@@ -2066,6 +2452,64 @@ struct ContentView: View {
                     }
                 }
                 .disabled(!model.experimentalUnlocked)
+                Divider()
+                Text("Factory tests (the original's Test window)")
+                    .font(.subheadline.weight(.semibold))
+                HStack {
+                    Button(model.isLampTestActive ? "End lamp test" : "Start lamp test") { model.toggleLampTest() }
+                        .help("Powers the fan off, then toggles the LED test pattern (0xE1).")
+                    Button("Upload test picture") { model.uploadTestPicture() }
+                        .disabled(model.isUploadingFTLV || model.isProjecting)
+                        .help("Four solid frames, red, green, blue, and white, 2 seconds each.")
+                }
+                .disabled(!model.experimentalUnlocked)
+                Text("Raw command (hex, CRC added automatically)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    TextField("68 11 00 00", text: $model.rawCommandText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .onSubmit { model.sendRawCommand() }
+                    Button("Send") { model.sendRawCommand() }
+                }
+                .disabled(!model.experimentalUnlocked)
+                HStack {
+                    Toggle("Hide heartbeat and status traffic", isOn: $model.consoleHidesRoutine)
+                        .font(.caption)
+                    Spacer()
+                    Button("Clear") { model.consoleLines.removeAll() }
+                        .controlSize(.small)
+                }
+                ScrollView {
+                    Text(model.consoleLines.suffix(60).joined(separator: "\n"))
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 110)
+                .background(Color(nsColor: .textBackgroundColor))
+                Divider()
+                Text("Firmware update from a local package")
+                    .font(.subheadline.weight(.semibold))
+                Text("Uses a .POVC file already on this Mac, such as the one bundled with the original app (356256A/package/1.POVC). Downloading firmware needs the manufacturer's server and is not supported. A failed or mismatched update could leave the fan unusable.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Choose firmware package…") { model.chooseFirmwarePackage() }
+                        .disabled(model.isUpdatingFirmware)
+                    if model.isUpdatingFirmware {
+                        ProgressView(value: model.firmwareProgress)
+                            .frame(maxWidth: 160)
+                    }
+                }
+                .disabled(!model.experimentalUnlocked)
+                if !model.firmwareMessage.isEmpty {
+                    Text(model.firmwareMessage)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                }
+                Divider()
                 HStack {
                     Button("Pair remote control…") { model.pendingExperimentalAction = .remotePairing }
                         .disabled(model.isRemoteMatching)
@@ -2122,6 +2566,13 @@ struct ContentView: View {
         }
     }
 
+    /// `rotationSpeedRPM` holds the fan's raw speed value. On the user's fan it read 680 while running and
+    /// fell to 0 after power-off, so it behaves like RPM (a period would rise as the blades slow).
+    static func speedDescription(_ value: Int) -> String {
+        guard value > 0 else { return "Not spinning (0)" }
+        return "≈\(value.formatted()) RPM (raw value; the original showed \((60_000_000 / value).formatted()))"
+    }
+
     static func label(_ mode: FileDisplayMode) -> String {
         switch mode {
         case .allDay: return "All day"
@@ -2135,13 +2586,27 @@ struct ContentView: View {
             if let info = model.deviceInfo {
                 VStack(alignment: .leading, spacing: 4) {
                     infoRow("Model", info.deviceModel.isEmpty ? "—" : info.deviceModel)
-                    infoRow("Firmware", model.versionInfo.map { "\($0.firmware) (model \($0.model), protocol \($0.agreement))" } ?? "—")
+                    infoRow("Firmware", model.versionInfo.map { String(format: "%.2f (model %d, protocol %d)", Double($0.firmware) / 100, $0.model, $0.agreement) } ?? "—")
                     infoRow("Serial", info.serialNumber)
                     infoRow(
                         "Factory date",
                         String(format: "%04d-%02d-%02d", info.factoryDate.year ?? 0, info.factoryDate.month ?? 0, info.factoryDate.day ?? 0)
                     )
                     infoRow("Display", "\(info.imageWidth)×\(info.imageSize) px, diameter \(info.diameter), up to \(info.maxFPS) fps")
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Rotation speed")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 100, alignment: .leading)
+                        Text(model.rotationSpeedRPM.map(Self.speedDescription) ?? "—")
+                            .monospacedDigit()
+                            .help("The fan's value drops to 0 when the blades stop, so it reads as RPM. The original Test window showed 60,000,000 ÷ value, which gives impossible speeds.")
+                        Spacer(minLength: 0)
+                        if model.isMeasuringSpeed { ProgressView().controlSize(.small) }
+                        Button("Measure") { model.measureRotationSpeed() }
+                            .controlSize(.small)
+                            .disabled(model.isMeasuringSpeed)
+                    }
+                    .font(.callout)
                     infoRow("Content type", "\(info.contentType)\(info.contentType == 3 ? " (LED transcoding; media conversion not yet supported)" : "")")
                     infoRow("Capacity", info.sdUsablePercent.map { "\($0.formatted())% usable" } ?? "—")
                     infoRow(
@@ -2458,8 +2923,15 @@ private struct MediaConversionSheet: View {
                     Spacer()
                     Button("Cancel", role: .cancel) { model.closeMediaConversion() }
                         .keyboardShortcut(.cancelAction)
+                    Picker("Export for", selection: binding(\.exportFormat)) {
+                        ForEach(model.availableExportFormats) { format in
+                            Text(model.exportFormatLabel(format)).tag(format)
+                        }
+                    }
+                    .frame(width: 220)
+                    .help("Like the original Export window: generic FTLV, or mold-encoded files for device types 25 and 26.")
                     Button("Export .ftlv…") { model.exportMediaConversion() }
-                        .disabled(state.isWorking || model.conversionUnsupportedReason != nil)
+                        .disabled(state.isWorking || (state.exportFormat == .fan && model.conversionUnsupportedReason != nil))
                     Button("Convert & upload") { model.runMediaConversion() }
                         .keyboardShortcut(.defaultAction)
                         .disabled(
@@ -2533,5 +3005,51 @@ private struct MediaConversionSheet: View {
             get: { model.mediaConversion?[keyPath: keyPath] ?? fallback! },
             set: { model.mediaConversion?[keyPath: keyPath] = $0 }
         )
+    }
+}
+
+/// Final check before flashing: package versus fan, with the original's model and version rules.
+private struct FirmwareConfirmationSheet: View {
+    @ObservedObject var model: DeviceViewModel
+    let candidate: DeviceViewModel.FirmwareCandidate
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Update fan firmware?").font(.title2.bold())
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                GridRow {
+                    Text("Package").foregroundStyle(.secondary)
+                    Text("\(candidate.url.lastPathComponent): model \(candidate.package.model), version \(DeviceViewModel.firmwareVersionText(candidate.package.version))")
+                }
+                GridRow {
+                    Text("Fan").foregroundStyle(.secondary)
+                    Text(model.versionInfo.map { "model \($0.model), version \(DeviceViewModel.firmwareVersionText($0.firmware))" } ?? "version not read yet")
+                }
+            }
+            if let version = model.versionInfo {
+                if candidate.package.model != Int(version.model) {
+                    Text("Model mismatch. The original app only installs packages for the fan's own model; flashing another model's firmware is very likely to break the fan.")
+                        .foregroundStyle(.red)
+                    Toggle("Override the model check (the original factory Test window's behavior)", isOn: $model.allowFirmwareModelMismatch)
+                } else if !candidate.package.isAutomaticUpdate(forModel: Int(version.model), firmware: version.firmware) {
+                    Text("This package is not newer than the fan's firmware. The original app would not offer it automatically.")
+                        .foregroundStyle(.orange)
+                }
+            }
+            Text("Keep the fan powered and on this network until the update finishes. The fan may restart afterwards.")
+                .font(.callout)
+            if let reason = model.firmwareBlockReason {
+                Text(reason).font(.caption).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { model.firmwareCandidate = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Update firmware", role: .destructive) { model.startFirmwareUpdate() }
+                    .disabled(model.firmwareBlockReason != nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
     }
 }

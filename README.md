@@ -59,4 +59,13 @@ Capture uses ScreenCaptureKit, so macOS asks for Screen Recording permission. Be
 
 **Experimental (locked behind a checkbox, untested):** factory reset (`0x19 0x55`), remote-control pairing (`0x22`, start 0 / cancel 1; the fan answers 2 when matched), and router disconnect (`0x07` with flag 0). Firmware updates are not available: the original downloads packages from the manufacturer's server, and a failed update could leave the fan unusable.
 
-Still not built: multi-fan splicing, sync groups, and batch commands (`0x50`–`0x53`, UDP group play); LED transcoding for content-type-3 and type-25/26 fans (needed by both conversion and projection on those models); and the cloud/login service.
+**Group tab (multi-fan, untested with more than one fan):**
+- connects several discovered fans at once;
+- batch power, brightness, display mode, Bluetooth, auto power-on, clock sync, play, and sync-group assignment;
+- lists files that differ between fans and can delete the ones the host lacks;
+- uploads to all fans, with per-fan conversion;
+- splicing layout with tiers, identify-on-hover, saved positions (`0x50`), and spliced uploads that give each fan its part of one picture or video.
+
+The single-fan Configuration page also has the sync-group setting (`0x51`). Content-type-3 and type-1 fans are supported through the original's LED transcoding (mold JPEGs and bin bit planes), and exports can target device types 25 and 26. Help → SpinDisplay Manual opens the manufacturer's manual if you place a copy of the original app's `help.pdf` at `Resources/help.pdf` before running `./build-app.sh`. The manual is copyrighted, so it is git-ignored and not distributed; without it, the menu opens the manufacturer's SpinDisplay page.
+
+Still not built: the splicing "Device Name Splice Mode" (rename fans by grid position), per-fan device angle in the layout, the splicing blur/template options, and the original's Chinese, Japanese, and Korean UI languages. The cloud/login service is out of scope.

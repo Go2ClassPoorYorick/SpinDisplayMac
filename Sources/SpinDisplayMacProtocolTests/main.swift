@@ -26,6 +26,7 @@ enum SpinDisplayProtocolTests {
         testFTLVWriter()
         testFTLVTimingAndAudio()
         testBaselineJPEGEncoder()
+        testLEDTranscoding()
         print("All SpinDisplay protocol tests passed.")
     }
 
@@ -404,6 +405,46 @@ enum SpinDisplayProtocolTests {
         precondition(SpinDisplayProtocol.projectionFrameHeader(length: 0x012345) == [0xfa, 0x45, 0x23, 0x01])
         precondition(SpinDisplayProtocol.projectionFrameHeader(length: 1 << 24) == nil)
 
+        // Original Send.GetSpeed (no payload) and TestWindow's 60,000,000 / period display.
+        assertFrame(SpinDisplayProtocol.rotationSpeedRequest(), command: 0xe0, payloadLength: 0)
+        let speed = SpinDisplayProtocol.frame(command: 0xe0, payload: [0x20, 0x4e, 0x00, 0x00])  // 20,000 µs
+        precondition(SpinDisplayProtocol.parseRotationSpeedRPM(speed) == 3000)
+        precondition(SpinDisplayProtocol.parseRotationSpeedRPM(SpinDisplayProtocol.frame(command: 0xe0, payload: [0, 0, 0, 0])) == 0)
+        precondition(SpinDisplayProtocol.parseRotationSpeedRPM(SpinDisplayProtocol.frame(command: 0xe0, payload: [1])) == nil)
+
+        // Original Send.LampTest and the Test window's raw sender (CRC appended).
+        assertFrame(SpinDisplayProtocol.lampTestRequest(isOn: true), command: 0xe1, payloadLength: 1)
+        precondition(SpinDisplayProtocol.lampTestRequest(isOn: true)[4] == 1 && SpinDisplayProtocol.lampTestRequest(isOn: false)[4] == 0)
+        precondition(SpinDisplayProtocol.rawPacket(hex: "68 11 00 00") == SpinDisplayProtocol.frame(command: 0x11))
+        precondition(SpinDisplayProtocol.rawPacket(hex: "68 17 01 00 01") == SpinDisplayProtocol.powerRequest(isOn: true))
+        precondition(SpinDisplayProtocol.rawPacket(hex: "68 1") == nil && SpinDisplayProtocol.rawPacket(hex: "11 00 00 00") == nil)
+        precondition(SpinDisplayProtocol.rawPacket(hex: "68 zz 00 00") == nil)
+
+        // Original FOTA: 4-byte little-endian payload length; .POVC header per App.initPackage.
+        let fota = SpinDisplayProtocol.firmwareUpdateRequest(length: 57_120)
+        assertFrame(fota, command: 0x15, payloadLength: 4)
+        precondition(Array(fota![4..<8]) == [0x20, 0xdf, 0x00, 0x00])
+        precondition(SpinDisplayProtocol.firmwareUpdateRequest(length: 0) == nil)
+        let bundled = FirmwarePackageInfo.parse(header: [0xff, 0xaa, 0x01, 0x30, 0x20, 0xdf, 0x00, 0x00], fileLength: 57_128)
+        precondition(bundled == FirmwarePackageInfo(model: 1, version: 148, payloadLength: 57_120))
+        precondition(FirmwarePackageInfo.parse(header: [0xff, 0x03, 0x02, 0x05, 0, 0, 0, 0], fileLength: 100)?.model == 3)
+        precondition(FirmwarePackageInfo.parse(header: [0x00, 0xaa, 0x01, 0x30, 0, 0, 0, 0], fileLength: 100) == nil)
+        precondition(bundled!.isAutomaticUpdate(forModel: 1, firmware: 147))
+        precondition(!bundled!.isAutomaticUpdate(forModel: 1, firmware: 148))
+        precondition(!bundled!.isAutomaticUpdate(forModel: 2, firmware: 100))
+
+        // Original Send.SetGroup / SetCoord / JointModel / SelectDevice.
+        let group = SpinDisplayProtocol.syncGroupRequest(group: 3, isHost: true)
+        assertFrame(group, command: 0x51, payloadLength: 2)
+        precondition(Array(group![4..<6]) == [3, 1])
+        precondition(Array(SpinDisplayProtocol.syncGroupRequest(group: 0, isHost: true)![4..<6]) == [0, 0])
+        precondition(SpinDisplayProtocol.syncGroupRequest(group: 21, isHost: false) == nil)
+        let coordinate = SpinDisplayProtocol.setCoordinateRequest(x: 300, y: -2, level: 1, model: 2)
+        assertFrame(coordinate, command: 0x50, payloadLength: 6)
+        precondition(Array(coordinate[4..<10]) == [0x2c, 0x01, 0xfe, 0xff, 1, 2])
+        precondition(Array(SpinDisplayProtocol.jointModeRequest(1)[0..<5]) == [0x68, 0x52, 1, 0, 1])
+        precondition(SpinDisplayProtocol.selectDeviceRequest(isSelected: true)[4] == 1)
+
         let deleteAll = SpinDisplayProtocol.deleteAllFilesRequest()
         assertFrame(deleteAll, command: 0x32, payloadLength: 2)
         precondition(Array(deleteAll[4..<6]) == [1, 0])
@@ -568,10 +609,20 @@ enum SpinDisplayProtocolTests {
         precondition(MediaConverter.cropRect(width: 1920, height: 1080, crop: .init(framing: .fit)) == fit)
         precondition(MediaConverter.cropRect(width: 400, height: 200, crop: .init(zoom: 2, centerX: 0.25, centerY: 0.25))
             == CGRect(x: 50, y: 0, width: 100, height: 100))
-        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: .init(zoom: 100)).width == 200 / 6)
-        precondition(MediaConverter.unsupportedReason(deviceType: 25, contentType: 0) != nil)
-        precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 3) != nil)
-        precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 1) == nil)
+        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: .init(zoom: 100)).width == 200 / 20)
+        precondition(MediaConverter.unsupportedReason(contentType: 0, hasTranscoding: false, hasBinConfiguration: false) == nil)
+        precondition(MediaConverter.unsupportedReason(contentType: 3, hasTranscoding: false, hasBinConfiguration: false) != nil)
+        precondition(MediaConverter.unsupportedReason(contentType: 3, hasTranscoding: true, hasBinConfiguration: false) == nil)
+        precondition(MediaConverter.unsupportedReason(contentType: 1, hasTranscoding: false, hasBinConfiguration: false) != nil)
+        precondition(MediaConverter.unsupportedReason(contentType: 1, hasTranscoding: false, hasBinConfiguration: true) == nil)
+
+        // Splicing: two 100-unit fans side by side over a 400×200 source → each gets one 200×200 half.
+        let splice = MediaConverter.spliceCrops(
+            circles: [(id: "a", center: CGPoint(x: 50, y: 50), diameter: 100), (id: "b", center: CGPoint(x: 150, y: 50), diameter: 100)],
+            sourceWidth: 400, sourceHeight: 200
+        )
+        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: splice["a"]!) == CGRect(x: 0, y: 0, width: 200, height: 200))
+        precondition(MediaConverter.cropRect(width: 400, height: 200, crop: splice["b"]!) == CGRect(x: 200, y: 0, width: 200, height: 200))
 
         // Original trims to whole seconds; holding the last frame rounds up instead.
         precondition(MediaConverter.availableSeconds(duration: 7.152, holdLastFrame: false) == 7)
@@ -658,5 +709,76 @@ enum SpinDisplayProtocolTests {
             }
         }
         precondition(Double(gradientError) / Double(width * height * 2) < 40, "4:2:0 round-trip error too high")
+    }
+
+    // JpgBinTool / BinTool reconstructions, plus the 0x3B / 0x39 / 0x38 packets.
+    private static func testLEDTranscoding() {
+        // Mold geometry: 30 LEDs pad to 32 (covering 2); 16 rows over 2 bars → perNum 8, times 1.
+        let mold = MoldTranscoder(ledCount: 30, rows: 16, orientation: 0, adjust: nil, lights: nil,
+                                  perBar: 1, lightBarCount: 2, quality: 90, imageWidth: 64)
+        precondition(mold.outputWidth == 32 && mold.outputHeight == 16)
+        precondition(mold.molds.count == 32 * 16)
+        precondition(mold.molds.prefix(2).allSatisfy { $0 == -1 })
+        // First LED of the first line sits on the rim at angle 0: x = round(29 + 33.5) = 62 (banker's), y = 33.5 → 34.
+        precondition(mold.molds[2] == Int32((34 - 1) * 64 + 62 - 1))
+
+        // A solid red frame: every LED slot is B 0, G 0, R 255 (BGR order); padding slots stay black.
+        var red = [UInt8](repeating: 255, count: 64 * 64 * 4)
+        for pixel in 0..<(64 * 64) { red[pixel * 4] = 255; red[pixel * 4 + 1] = 0; red[pixel * 4 + 2] = 0 }
+        let bytes = mold.moldBytes(rgba: red, width: 64, height: 64)
+        precondition(Array(bytes[0..<6]) == [0, 0, 0, 0, 0, 0])
+        precondition(Array(bytes[6..<9]) == [0, 0, 255])
+        let moldJPEG = [UInt8](mold.jpeg(rgba: red, width: 64, height: 64))
+        guard let moldSource = CGImageSourceCreateWithData(Data(moldJPEG) as CFData, nil),
+              let moldImage = CGImageSourceCreateImageAtIndex(moldSource, 0, nil) else {
+            preconditionFailure("mold JPEG did not decode")
+        }
+        precondition(moldImage.width == 32 && moldImage.height == 16)
+        precondition(MoldTranscoder.exportPreset(deviceType: 25, imageWidth: 672)?.outputWidth == 304)
+        precondition(MoldTranscoder.exportPreset(deviceType: 26, imageWidth: 672)?.outputHeight == 1408)
+        precondition(MoldTranscoder.exportPreset(deviceType: 1, imageWidth: 672) == nil)
+
+        // Bin packing: 1 bar, 1 subsection, 1 bit, 2 LEDs × 1 row → 6 mold bytes → 6 bits, MSB first.
+        let config = FanBinConfiguration(ledCount: 2, subsection: 1, lamps: 1, rows: 1, color: 1, bit: 1,
+                                         orientation: 0, perBar: 1, adjust: (0..<256).map { UInt8($0) }, lights: [1, 1])
+        precondition(BinTranscoder.pack([0x80, 0x00, 0xff, 0x00, 0x80, 0x00], configuration: config, perBar: 1) == [])
+        let config8 = FanBinConfiguration(ledCount: 2, subsection: 1, lamps: 1, rows: 4, color: 1, bit: 1,
+                                          orientation: 0, perBar: 1, adjust: (0..<256).map { UInt8($0) }, lights: [1, 1])
+        // 4 rows × 6 bytes = 24 bytes → 3 output bytes; only bytes with bit 7 set produce 1 bits.
+        var rowBytes = [UInt8](repeating: 0, count: 24)
+        rowBytes[0] = 0x80; rowBytes[7] = 0xff; rowBytes[23] = 0x81
+        precondition(BinTranscoder.pack(rowBytes, configuration: config8, perBar: 1) == [0x81, 0x00, 0x01])  // bits are taken in byte order, MSB first
+
+        // 0x38: name, µs per frame, frames, audio flag, key; bytes 4–32 XORed with the key at byte 33.
+        let bin = SpinDisplayProtocol.binSendRequest(name: "clip", frameDuration: 50_000, frames: 20, hasAudio: false, key: 0x5a)!
+        assertFrame(bin, command: 0x38, payloadLength: 30)
+        let decoded = (4..<33).map { bin[$0] ^ 0x5a }
+        precondition(Array(decoded[0..<4]) == Array("clip".utf8) && decoded[4..<20].allSatisfy { $0 == 0 })
+        precondition(Array(decoded[20..<24]) == [0x50, 0xc3, 0, 0] && Array(decoded[24..<28]) == [20, 0, 0, 0] && decoded[28] == 0)
+        precondition(bin[33] == 0x5a)
+        precondition(SpinDisplayProtocol.binSendRequest(name: "x", frameDuration: 1, frames: 1, hasAudio: false, key: 0) == nil)
+        assertFrame(SpinDisplayProtocol.transcodingQuery(), command: 0x3b, payloadLength: 0)
+        assertFrame(SpinDisplayProtocol.binParameterQuery(), command: 0x39, payloadLength: 0)
+        assertFrame(SpinDisplayProtocol.noticeAudioRequest(), command: 0x3a, payloadLength: 0)
+
+        // 0x3B parse: header fields, 256-byte adjust, then ledNum ratio bytes.
+        var transcodingPayload = [UInt8](repeating: 0, count: 264 + 3)
+        transcodingPayload[0] = 3; transcodingPayload[2] = 16; transcodingPayload[4] = 1
+        transcodingPayload[5] = 2; transcodingPayload[6] = 2; transcodingPayload[7] = 80
+        transcodingPayload[8] = 7; transcodingPayload[264] = 50; transcodingPayload[266] = 120
+        let transcoding = SpinDisplayProtocol.parseTranscoding(SpinDisplayProtocol.frame(command: 0x3b, payload: transcodingPayload))
+        precondition(transcoding?.ledCount == 3 && transcoding?.rows == 16 && transcoding?.direction == 1)
+        precondition(transcoding?.deliveryTimes == 2 && transcoding?.lightBarCount == 2 && transcoding?.quality == 80)
+        precondition(transcoding?.adjust.first == 7 && transcoding?.ratio == [50, 0, 120])
+
+        // 0x39 parse: lights right-aligned (2 values for 4 LEDs → [1, 1, 0.5, 1.2]).
+        var binPayload = [UInt8](repeating: 0, count: 266 + 2)
+        binPayload[0] = 4; binPayload[2] = 3; binPayload[3] = 2; binPayload[4] = 64
+        binPayload[6] = 4; binPayload[7] = 8; binPayload[8] = 1; binPayload[9] = 1
+        binPayload[266] = 50; binPayload[267] = 120
+        let binConfiguration = SpinDisplayProtocol.parseBinConfiguration(SpinDisplayProtocol.frame(command: 0x39, payload: binPayload))
+        precondition(binConfiguration?.ledCount == 4 && binConfiguration?.subsection == 3 && binConfiguration?.lamps == 2)
+        precondition(binConfiguration?.rows == 64 && binConfiguration?.color == 4 && binConfiguration?.bit == 8)
+        precondition(binConfiguration?.lights == [1, 1, 0.5, 1.2])
     }
 }

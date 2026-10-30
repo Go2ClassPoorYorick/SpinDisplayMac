@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 import SpinDisplayCore
 
-final class DeviceConnection {
+/// Thread-safe: state is guarded by its locks and conditions, so it may be used from background queues.
+final class DeviceConnection: @unchecked Sendable {
     var onMessage: ((String) -> Void)?
     var onPowerChanged: ((Bool) -> Void)?
     var onBrightnessChanged: ((UInt8) -> Void)?
@@ -11,6 +12,11 @@ final class DeviceConnection {
     var onDeviceInfoChanged: ((FanDeviceInfo) -> Void)?
     var onVersionChanged: ((FanVersionInfo) -> Void)?
     var onSettingAcknowledged: ((UInt8, UInt8) -> Void)?
+    var onRotationSpeed: ((Int) -> Void)?
+    var onTranscoding: ((FanTranscoding) -> Void)?
+    var onBinConfiguration: ((FanBinConfiguration) -> Void)?
+    /// Every received frame, for the developer console.
+    var onRawFrame: (([UInt8]) -> Void)?
     /// Called when an active projection ends without `stopProjection()` (send failure or the fan stopping it).
     var onProjectionEnded: ((String) -> Void)?
     var onDisconnected: ((String) -> Void)?
@@ -27,6 +33,10 @@ final class DeviceConnection {
     private var uploadWaitStage: UploadWaitStage?
     private var uploadResponse: UInt8?
     private var uploadSocket: Int32?
+    /// While true, 0x15 firmware statuses are delivered through the upload response slot.
+    private var firmwareUpdateActive = false
+    /// While true, 0x38 bin-transfer statuses are delivered through the upload response slot.
+    private var binUploadActive = false
     private let projectionCondition = NSCondition()
     private let projectionQueue = DispatchQueue(label: "SpinDisplay.projection")
     private var projectionSocket: Int32?
@@ -133,6 +143,86 @@ final class DeviceConnection {
             } catch {
                 completion(.failure(error))
             }
+        }
+    }
+
+    /// Original `TcpServer.updatePackage`: flashes a `.POVC` package. The caller is responsible for the
+    /// model and version checks; this only validates the package header.
+    func updateFirmware(
+        at url: URL,
+        progress: @escaping (Double, String) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                try performFirmwareUpdate(at: url, progress: progress)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func performFirmwareUpdate(at url: URL, progress: @escaping (Double, String) -> Void) throws {
+        let data = try Data(contentsOf: url)
+        guard let package = FirmwarePackageInfo.parse(header: Array(data.prefix(FirmwarePackageInfo.headerLength)), fileLength: data.count),
+              let announce = SpinDisplayProtocol.firmwareUpdateRequest(length: package.payloadLength) else {
+            throw ConnectionError.invalidFirmwarePackage
+        }
+        progress(0, "Opening the fan's data connection…")
+        let dataSocket = try openDataSocket()
+        do {
+            try beginUpload(dataSocket)
+            uploadCondition.lock()
+            firmwareUpdateActive = true
+            uploadCondition.unlock()
+            defer {
+                uploadCondition.lock()
+                firmwareUpdateActive = false
+                uploadCondition.unlock()
+            }
+
+            // The original repeats FOTA once a second until the fan answers 0.
+            progress(0, "Announcing the firmware package…")
+            let readyDeadline = Date().addingTimeInterval(60)
+            var ready = false
+            while Date() < readyDeadline {
+                try sendPacket(announce)
+                guard let status = try waitForUploadStatus(timeout: 1) else { continue }
+                if status == 0 {
+                    ready = true
+                    break
+                }
+            }
+            guard ready else { throw ConnectionError.firmwareNotAccepted }
+
+            let payload = data.dropFirst(FirmwarePackageInfo.headerLength)
+            var sent = 0
+            for chunkStart in stride(from: payload.startIndex, to: payload.endIndex, by: 1024) {
+                let chunk = payload[chunkStart..<min(chunkStart + 1024, payload.endIndex)]
+                try Self.sendData(Data(chunk), on: dataSocket)
+                sent += chunk.count
+                progress(Double(sent) / Double(package.payloadLength) * 0.9, "Sending firmware… do not power off the fan.")
+            }
+
+            progress(0.9, "Waiting for the fan to apply the firmware… do not power off the fan.")
+            let doneDeadline = Date().addingTimeInterval(180)
+            while Date() < doneDeadline {
+                do {
+                    guard let status = try waitForUploadStatus(timeout: 1) else { continue }
+                    if status == 2 {
+                        progress(1, "Upgrade successful. The fan may restart.")
+                        finishUpload(socketDescriptor: dataSocket)
+                        return
+                    }
+                } catch ConnectionError.disconnected {
+                    throw ConnectionError.firmwareConnectionDropped
+                }
+            }
+            throw ConnectionError.firmwareNotConfirmed
+        } catch {
+            finishUpload(socketDescriptor: dataSocket)
+            throw error
         }
     }
 
@@ -379,6 +469,117 @@ final class DeviceConnection {
         onProjectionEnded?(message)
     }
 
+    func setLampTest(_ isOn: Bool) throws {
+        try sendPacket(SpinDisplayProtocol.powerRequest(isOn: false))
+        Thread.sleep(forTimeInterval: 0.1)
+        try sendPacket(SpinDisplayProtocol.lampTestRequest(isOn: isOn))
+    }
+
+    func sendRawPacket(_ packet: [UInt8]) throws {
+        try sendPacket(packet)
+    }
+
+    func setSyncGroup(_ group: Int, isHost: Bool) throws {
+        guard let packet = SpinDisplayProtocol.syncGroupRequest(group: group, isHost: isHost) else {
+            throw ConnectionError.invalidPlaylistIndex
+        }
+        try sendPacket(packet)
+    }
+
+    func sendCommand(_ packet: [UInt8]) throws {
+        try sendPacket(packet)
+    }
+
+    func requestTranscoding() throws {
+        try sendPacket(SpinDisplayProtocol.transcodingQuery())
+    }
+
+    func requestBinConfiguration() throws {
+        try sendPacket(SpinDisplayProtocol.binParameterQuery())
+    }
+
+    /// Original `SendBinFile` + `SendBinWork` for content-type-1 fans. `container` holds bin-encoded
+    /// frames (and optional audio) produced by the converter.
+    func uploadBin(
+        container url: URL,
+        name: String,
+        voiceDisabled: Bool,
+        progress: @escaping (Double, String) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                try performBinUpload(container: url, name: name, voiceDisabled: voiceDisabled, progress: progress)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func performBinUpload(container url: URL, name: String, voiceDisabled: Bool, progress: @escaping (Double, String) -> Void) throws {
+        let bytes = [UInt8](try Data(contentsOf: url))
+        guard let contents = FTLVContents.parse(bytes), !contents.videoBlocks.isEmpty,
+              let request = SpinDisplayProtocol.binSendRequest(
+                name: name, frameDuration: contents.info.frameDuration, frames: contents.videoBlocks.count,
+                hasAudio: false, key: UInt8.random(in: 1...254)
+              ) else {
+            throw ConnectionError.invalidFTLVFile
+        }
+        progress(0, "Opening the fan's media-transfer connection…")
+        let dataSocket = try openDataSocket()
+        do {
+            try beginUpload(dataSocket)
+            uploadCondition.lock()
+            binUploadActive = true
+            uploadCondition.unlock()
+            defer {
+                uploadCondition.lock()
+                binUploadActive = false
+                uploadCondition.unlock()
+            }
+            try waitForUploadReady(request: request)
+
+            let frames = contents.videoBlocks
+            for (index, block) in frames.enumerated() {
+                try Self.sendData(Data(bytes[block.offset..<(block.offset + block.length)]), on: dataSocket)
+                progress(Double(index + 1) / Double(frames.count) * 0.9, "Sending frame \(index + 1) of \(frames.count)…")
+            }
+
+            // Audio: 44,100 × frames / fps unsigned 8-bit samples, sent in 1 MB pieces; 0x3A if there is none.
+            if !voiceDisabled, frames.count > 1 {
+                let milliseconds = max(1, contents.info.frameDuration / 1000)
+                let fps = max(1, 1000 / milliseconds)
+                if let audio = contents.audioBlock {
+                    var samples = [UInt8](repeating: 0, count: 44_100 * frames.count / fps)
+                    let available = min(audio.length, samples.count)
+                    samples.replaceSubrange(0..<available, with: bytes[audio.offset..<(audio.offset + available)])
+                    progress(0.92, "Sending audio…")
+                    for start in stride(from: 0, to: samples.count, by: 1 << 20) {
+                        try Self.sendData(Data(samples[start..<min(start + (1 << 20), samples.count)]), on: dataSocket)
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                } else {
+                    try sendPacket(SpinDisplayProtocol.noticeAudioRequest())
+                }
+            }
+
+            Thread.sleep(forTimeInterval: 1)
+            try setUploadWaitStage(.waitingForCompletion)
+            try waitForUploadCompletion(timeout: 120)
+            try refreshPlaylist()
+            progress(1, "Upload complete. Playlist refresh requested.")
+            finishUpload(socketDescriptor: dataSocket)
+        } catch {
+            finishUpload(socketDescriptor: dataSocket)
+            throw error
+        }
+    }
+
+    func requestRotationSpeed() throws {
+        try sendPacket(SpinDisplayProtocol.rotationSpeedRequest())
+    }
+
     func refreshDeviceInfo() throws {
         try sendPacket(SpinDisplayProtocol.frame(command: SpinDisplayProtocol.parameterCommand))
     }
@@ -608,6 +809,7 @@ final class DeviceConnection {
 
     private func handle(_ frame: [UInt8]) {
         guard frame.count >= 6 else { return }
+        onRawFrame?(frame)
         switch frame[1] {
         case SpinDisplayProtocol.fileSendCommand:
             guard let status = SpinDisplayProtocol.parseFileSendStatus(frame) else {
@@ -639,6 +841,13 @@ final class DeviceConnection {
             onPowerChanged?(info.isOn)
             onBrightnessChanged?(info.brightness)
             onDeviceInfoChanged?(info)
+        case SpinDisplayProtocol.firmwareUpdateCommand where frame.count >= 7:
+            uploadCondition.lock()
+            if firmwareUpdateActive {
+                uploadResponse = frame[4]
+                uploadCondition.signal()
+            }
+            uploadCondition.unlock()
         case SpinDisplayProtocol.projectionCommand where frame.count >= 7:
             let status = frame[4]
             projectionCondition.lock()
@@ -652,6 +861,33 @@ final class DeviceConnection {
             if !starting, status != 0 {
                 endProjection(notify: "The fan ended projection (status \(status)).")
             }
+        case SpinDisplayProtocol.binSendCommand where frame.count >= 7:
+            uploadCondition.lock()
+            let isBinUpload = binUploadActive
+            if isBinUpload {
+                uploadResponse = frame[4]
+                uploadCondition.signal()
+            }
+            uploadCondition.unlock()
+            if !isBinUpload { onMessage?("Received an unsolicited bin-transfer status \(frame[4]).") }
+        case SpinDisplayProtocol.transcodingCommand:
+            if let transcoding = SpinDisplayProtocol.parseTranscoding(frame) {
+                onTranscoding?(transcoding)
+            } else {
+                onMessage?("Received incomplete LED transcoding parameters.")
+            }
+        case SpinDisplayProtocol.binParameterCommand:
+            if let configuration = SpinDisplayProtocol.parseBinConfiguration(frame) {
+                onBinConfiguration?(configuration)
+            } else {
+                onMessage?("Received incomplete bin encoding parameters.")
+            }
+        case SpinDisplayProtocol.rotationSpeedCommand:
+            if let value = SpinDisplayProtocol.parseRotationSpeedValue(frame) {
+                onRotationSpeed?(value)
+            } else {
+                onMessage?("Received an incomplete rotation-speed response.")
+            }
         case SpinDisplayProtocol.versionCommand:
             if let version = SpinDisplayProtocol.parseVersion(frame) {
                 onVersionChanged?(version)
@@ -662,6 +898,9 @@ final class DeviceConnection {
              SpinDisplayProtocol.changeFileCommand,
              SpinDisplayProtocol.deleteFileCommand,
              SpinDisplayProtocol.resetCommand,
+             SpinDisplayProtocol.syncGroupCommand,
+             SpinDisplayProtocol.setCoordinateCommand,
+             SpinDisplayProtocol.jointModeCommand,
              SpinDisplayProtocol.remoteMatchCommand:
             if let status = SpinDisplayProtocol.parseSettingStatus(frame, command: frame[1]) {
                 onSettingAcknowledged?(frame[1], status)
@@ -1005,6 +1244,10 @@ final class DeviceConnection {
         case fileChangedDuringUpload
         case uploadInProgress
         case projectionInProgress
+        case invalidFirmwarePackage
+        case firmwareNotAccepted
+        case firmwareNotConfirmed
+        case firmwareConnectionDropped
         case projectionRejected(status: UInt8)
         case projectionTimedOut
 
@@ -1051,6 +1294,14 @@ final class DeviceConnection {
                 return "A media upload is already in progress."
             case .projectionInProgress:
                 return "Projection is already running."
+            case .invalidFirmwarePackage:
+                return "This is not a firmware package (.POVC files start with byte FF)."
+            case .firmwareNotAccepted:
+                return "The fan did not accept the firmware update within 60 seconds. Nothing was sent."
+            case .firmwareNotConfirmed:
+                return "The firmware was sent, but the fan did not confirm the upgrade within 3 minutes. Check the firmware version after reconnecting."
+            case .firmwareConnectionDropped:
+                return "The connection dropped after sending firmware, probably because the fan restarted. Reconnect and check the firmware version."
             case .projectionRejected(let status):
                 return "The fan kept answering status \(status) for 30 seconds and never accepted projection. It may not support projection, or another session may be using it."
             case .projectionTimedOut:

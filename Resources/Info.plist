@@ -14,6 +14,12 @@
     <string>SpinDisplay</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Native macOS client for SpinDisplay holographic fans, compatible with the Windows SpinDisplay 2.0.1.1 protocol.</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSLocalNetworkUsageDescription</key>

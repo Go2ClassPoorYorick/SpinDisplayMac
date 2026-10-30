@@ -32,7 +32,7 @@ public enum MediaConverter {
             self.centerY = centerY
         }
 
-        public static let zoomRange: ClosedRange<Double> = 0.5...6
+        public static let zoomRange: ClosedRange<Double> = 0.5...20
     }
 
     public enum MediaKind: Equatable, Sendable {
@@ -41,16 +41,34 @@ public enum MediaConverter {
         case video(duration: Double, sourceFPS: Double, hasAudio: Bool)
     }
 
+    /// How each rendered frame is encoded, following the original's per-content-type paths.
+    public enum FrameEncoding: @unchecked Sendable {
+        /// Plain circle JPEG (content types 0 and 2).
+        case standard
+        /// `JpgBinTool` mold JPEG in an `FTL`+device-type container (content type 3; export types 25/26).
+        case mold(MoldTranscoder, deviceType: UInt8)
+        /// `BinTool` bit planes (content type 1). The container is only used to hand frames and audio
+        /// to the bin uploader; it is not a file the fan understands.
+        case bin(BinTranscoder)
+    }
+
     public struct Target: Sendable {
         public var imageSize: Int
         public var maxFPS: Int
+        public var encoding: FrameEncoding
 
-        public init(imageSize: Int, maxFPS: Int) {
+        public init(imageSize: Int, maxFPS: Int, encoding: FrameEncoding = .standard) {
             self.imageSize = imageSize
             self.maxFPS = maxFPS
+            self.encoding = encoding
         }
 
         public static let generic = Target(imageSize: 672, maxFPS: 20)
+
+        var magic: FTLVWriter.Magic {
+            if case .mold(_, let deviceType) = encoding { return .deviceTyped(deviceType) }
+            return .standard
+        }
     }
 
     public struct Options: Sendable {
@@ -89,6 +107,7 @@ public enum MediaConverter {
         case noFrames
         case cancelled
         case encodingFailed
+        case unsupportedColorOrder
 
         public var errorDescription: String? {
             switch self {
@@ -96,6 +115,7 @@ public enum MediaConverter {
             case .noFrames: return "No frames could be decoded from the selected range."
             case .cancelled: return "Conversion was cancelled."
             case .encodingFailed: return "A frame could not be encoded as JPEG."
+            case .unsupportedColorOrder: return "The fan reported a colour order the original app does not support."
             }
         }
     }
@@ -108,15 +128,50 @@ public enum MediaConverter {
         return max(1, Int(seconds))
     }
 
-    /// The original only converts this way when the fan does not need its LED transcoding ("mold") path.
-    public static func unsupportedReason(deviceType: UInt8?, contentType: UInt8?) -> String? {
-        if let deviceType, [25, 26].contains(deviceType) {
-            return "Fan type \(deviceType) needs the original's LED transcoding, which is not implemented yet."
+    /// Content types 3 and 1 need parameters the fan reports after connecting (`0x3B` / `0x39`).
+    public static func unsupportedReason(contentType: UInt8?, hasTranscoding: Bool, hasBinConfiguration: Bool) -> String? {
+        if contentType == 3, !hasTranscoding {
+            return "Waiting for this fan's LED transcoding parameters (content type 3)…"
         }
-        if contentType == 3 {
-            return "This fan reports content type 3, which needs the original's LED transcoding (not implemented yet)."
+        if contentType == 1, !hasBinConfiguration {
+            return "Waiting for this fan's bin encoding parameters (content type 1)…"
         }
         return nil
+    }
+
+    /// Re-encodes an existing standard FTLV for a bin (content-type-1) fan, like the original
+    /// `SendFTLVBinWork`: each JPEG frame is decoded, scaled to the fan's image size, and bin-encoded.
+    public static func rebinFTLV(_ input: URL, target: Target, output: URL) throws {
+        guard case .bin = target.encoding else { throw ConversionError.unreadable }
+        let bytes = [UInt8](try Data(contentsOf: input))
+        guard let contents = FTLVContents.parse(bytes) else { throw ConversionError.unreadable }
+        let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: contents.info.frameDuration)
+        for block in contents.videoBlocks {
+            let jpegData = Data(bytes[block.offset..<(block.offset + block.length)])
+            guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw ConversionError.unreadable }
+            let squared = try render(image, size: target.imageSize, crop: Crop(framing: .fit))
+            try writer.appendVideoFrame(try encodeFrame(squared, target: target), duration: contents.info.frameDuration)
+        }
+        if let audio = contents.audioBlock {
+            try writer.appendAudio(Data(bytes[audio.offset..<(audio.offset + audio.length)]))
+        }
+        try writer.finish()
+    }
+
+    /// Encodes one rendered square frame for the target's content path.
+    public static func encodeFrame(_ image: CGImage, target: Target) throws -> Data {
+        switch target.encoding {
+        case .standard:
+            return try jpeg(image)
+        case .mold(let transcoder, _):
+            return transcoder.jpeg(rgba: try rgbaPixels(image), width: image.width, height: image.height)
+        case .bin(let transcoder):
+            guard let data = transcoder.encode(rgba: try rgbaPixels(image), width: image.width, height: image.height) else {
+                throw ConversionError.unsupportedColorOrder
+            }
+            return data
+        }
     }
 
     public static func inspect(_ url: URL) async throws -> MediaKind {
@@ -170,8 +225,8 @@ public enum MediaConverter {
                   let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw ConversionError.unreadable
             }
-            let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: FTLVWriter.stillImageFrameDuration)
-            try writer.appendVideoFrame(try jpeg(render(image, size: target.imageSize, crop: options.crop)),
+            let writer = try FTLVWriter(url: output, magic: target.magic, frameDuration: FTLVWriter.stillImageFrameDuration)
+            try writer.appendVideoFrame(try encodeFrame(render(image, size: target.imageSize, crop: options.crop), target: target),
                                         duration: FTLVWriter.stillImageFrameDuration)
             try writer.finish()
             progress(1, "Image converted.")
@@ -234,7 +289,7 @@ public enum MediaConverter {
             elapsed += delay
         }
 
-        let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: frameDuration)
+        let writer = try FTLVWriter(url: output, magic: target.magic, frameDuration: frameDuration)
         var cachedIndex = -1
         var cachedJPEG = Data()
         for frame in 0..<outputFrames {
@@ -243,7 +298,7 @@ public enum MediaConverter {
             let sourceIndex = max(0, (starts.lastIndex { $0 <= time } ?? 0))
             if sourceIndex != cachedIndex {
                 guard let image = CGImageSourceCreateImageAtIndex(source, sourceIndex, nil) else { throw ConversionError.unreadable }
-                cachedJPEG = try jpeg(render(image, size: target.imageSize, crop: options.crop))
+                cachedJPEG = try encodeFrame(render(image, size: target.imageSize, crop: options.crop), target: target)
                 cachedIndex = sourceIndex
             }
             try writer.appendVideoFrame(cachedJPEG, duration: frameDuration)
@@ -300,14 +355,14 @@ public enum MediaConverter {
         reader.add(videoOutput)
         guard reader.startReading() else { throw reader.error ?? ConversionError.unreadable }
 
-        let writer = try FTLVWriter(url: output, magic: .standard, frameDuration: frameDuration)
+        let writer = try FTLVWriter(url: output, magic: target.magic, frameDuration: frameDuration)
         var written = 0
         // Output frame k shows the latest source frame presented at or before start + k / fps.
         var current: (image: CGImage, jpeg: Data?)?
         func emitCurrent() throws {
             guard var frame = current else { return }
             if frame.jpeg == nil {
-                frame.jpeg = try jpeg(render(frame.image, size: target.imageSize, crop: options.crop))
+                frame.jpeg = try encodeFrame(render(frame.image, size: target.imageSize, crop: options.crop), target: target)
                 current = frame
             }
             try writer.appendVideoFrame(frame.jpeg!, duration: frameDuration)
@@ -417,6 +472,34 @@ public enum MediaConverter {
         return CGRect(x: (w - side) / 2, y: (h - side) / 2, width: side, height: side)
     }
 
+    /// Splicing: spreads one source over several fans' circles (centres and diameters in layout units).
+    /// The source fills the layout's bounding box; each fan's crop is the source region under its circle.
+    public static func spliceCrops(
+        circles: [(id: String, center: CGPoint, diameter: Double)],
+        sourceWidth: Int,
+        sourceHeight: Int
+    ) -> [String: Crop] {
+        let bounds = circles.reduce(CGRect.null) { bounds, circle in
+            bounds.union(CGRect(x: circle.center.x - circle.diameter / 2, y: circle.center.y - circle.diameter / 2,
+                                width: circle.diameter, height: circle.diameter))
+        }
+        guard !bounds.isNull, bounds.width > 0, bounds.height > 0, sourceWidth > 0, sourceHeight > 0 else { return [:] }
+        let width = Double(sourceWidth), height = Double(sourceHeight)
+        let scale = max(width / bounds.width, height / bounds.height)  // source pixels per layout unit
+        let offsetX = (width - bounds.width * scale) / 2, offsetY = (height - bounds.height * scale) / 2
+        var crops: [String: Crop] = [:]
+        for circle in circles {
+            let side = circle.diameter * scale
+            crops[circle.id] = Crop(
+                framing: .fill,
+                zoom: min(width, height) / side,
+                centerX: (offsetX + (circle.center.x - bounds.minX) * scale) / width,
+                centerY: (offsetY + (circle.center.y - bounds.minY) * scale) / height
+            )
+        }
+        return crops
+    }
+
     /// The square region (top-left origin, source pixels) that maps onto the fan's circle.
     public static func cropRect(width: Int, height: Int, crop: Crop) -> CGRect {
         let w = CGFloat(width), h = CGFloat(height)
@@ -461,6 +544,11 @@ public enum MediaConverter {
 
     /// Encodes like the original's libjpeg-turbo call: baseline, 4:4:4, quality 80, no restart markers.
     public static func jpeg(_ image: CGImage) throws -> Data {
+        BaselineJPEGEncoder.encode(rgba: try rgbaPixels(image), width: image.width, height: image.height, quality: 80)
+    }
+
+    /// Tightly packed RGBX pixels, top row first.
+    public static func rgbaPixels(_ image: CGImage) throws -> [UInt8] {
         let width = image.width, height = image.height
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
@@ -473,6 +561,6 @@ public enum MediaConverter {
             return true
         }
         guard drawn else { throw ConversionError.encodingFailed }
-        return BaselineJPEGEncoder.encode(rgba: pixels, width: width, height: height, quality: 80)
+        return pixels
     }
 }

@@ -159,6 +159,90 @@ public struct FanVersionInfo: Equatable, Sendable {
     }
 }
 
+/// A firmware package (`.POVC`) header, following the original `App.initPackage`: byte 0 is 0xFF,
+/// byte 1 the model (0xAA stands for model 1), and the version is `byte2 * 100 + byte3`.
+/// The rest of the file after the 8-byte header is what the fan receives.
+public struct FirmwarePackageInfo: Equatable, Sendable {
+    public static let headerLength = 8
+
+    public let model: Int
+    public let version: Int
+    public let payloadLength: Int
+
+    public init(model: Int, version: Int, payloadLength: Int) {
+        self.model = model
+        self.version = version
+        self.payloadLength = payloadLength
+    }
+
+    public static func parse(header: [UInt8], fileLength: Int) -> FirmwarePackageInfo? {
+        guard header.count >= headerLength, header[0] == 0xff, fileLength > headerLength else { return nil }
+        let model = header[1] == 0xaa ? 1 : Int(header[1])
+        guard model != 0 else { return nil }
+        return FirmwarePackageInfo(
+            model: model,
+            version: Int(header[2]) * 100 + Int(header[3]),
+            payloadLength: fileLength - headerLength
+        )
+    }
+
+    /// The original's automatic update rule (`App.UpdateFirmware`): same model and a newer version.
+    public func isAutomaticUpdate(forModel fanModel: Int, firmware fanFirmware: Int) -> Bool {
+        model == fanModel && version > fanFirmware
+    }
+}
+
+/// LED transcoding parameters for content-type-3 fans (`0x3B`, original `Receive.AnalyticTranscoding`).
+public struct FanTranscoding: Equatable, Sendable {
+    public let ledCount: Int
+    public let rows: Int
+    public let direction: Int
+    public let deliveryTimes: Int
+    public let lightBarCount: Int
+    public let quality: Int
+    public let adjust: [UInt8]
+    public let ratio: [UInt8]
+
+    public init(ledCount: Int, rows: Int, direction: Int, deliveryTimes: Int, lightBarCount: Int, quality: Int, adjust: [UInt8], ratio: [UInt8]) {
+        self.ledCount = ledCount
+        self.rows = rows
+        self.direction = direction
+        self.deliveryTimes = deliveryTimes
+        self.lightBarCount = lightBarCount
+        self.quality = quality
+        self.adjust = adjust
+        self.ratio = ratio
+    }
+}
+
+/// Bin-encoding parameters for content-type-1 fans (`0x39`, original `Receive.GetBinParam`).
+public struct FanBinConfiguration: Equatable, Sendable {
+    public let ledCount: Int
+    public let subsection: Int
+    public let lamps: Int
+    public let rows: Int
+    public let color: Int
+    public let bit: Int
+    public let orientation: Int
+    public let perBar: Int
+    public let adjust: [UInt8]
+    /// Per-LED brightness factors (1.0 unless the fan reports a value).
+    public let lights: [Double]
+
+    public init(ledCount: Int, subsection: Int, lamps: Int, rows: Int, color: Int, bit: Int, orientation: Int, perBar: Int, adjust: [UInt8], lights: [Double]) {
+        self.ledCount = ledCount
+        self.subsection = subsection
+        self.lamps = lamps
+        self.rows = rows
+        self.color = color
+        self.bit = bit
+        self.orientation = orientation
+        self.perBar = perBar
+        self.adjust = adjust
+        self.lights = lights
+    }
+}
+
 /// Display mode values from the original Settings window (`Radio_HighLight` / `Radio_TrueColor`).
 public enum FanDisplayMode: UInt8, CaseIterable, Sendable {
     case highlight = 0
@@ -250,6 +334,7 @@ public enum SpinDisplayProtocol {
     public static let parameterCommand: UInt8 = 0x12
     public static let brightnessCommand: UInt8 = 0x13
     public static let heartbeatCommand: UInt8 = 0x14
+    public static let firmwareUpdateCommand: UInt8 = 0x15
     public static let deviceNameCommand: UInt8 = 0x16
     public static let powerCommand: UInt8 = 0x17
     public static let angleCommand: UInt8 = 0x18
@@ -267,6 +352,18 @@ public enum SpinDisplayProtocol {
     public static let playControlCommand: UInt8 = 0x35
     public static let fileHeaderSendCommand: UInt8 = 0x36
     public static let projectionCommand: UInt8 = 0x37
+    public static let binSendCommand: UInt8 = 0x38
+    public static let setCoordinateCommand: UInt8 = 0x50
+    public static let syncGroupCommand: UInt8 = 0x51
+    public static let jointModeCommand: UInt8 = 0x52
+    public static let selectDeviceCommand: UInt8 = 0x53
+    public static let binParameterCommand: UInt8 = 0x39
+    public static let noticeAudioCommand: UInt8 = 0x3a
+    public static let transcodingCommand: UInt8 = 0x3b
+    /// Factory Test window "Speed" query (`Protocol.GetSpeed`).
+    public static let rotationSpeedCommand: UInt8 = 0xe0
+    /// Factory Test window lamp test (`Protocol.LampTest`).
+    public static let lampTestCommand: UInt8 = 0xe1
     /// Marker byte that starts each projection frame on the data channel (`Protocol.ProHeader`).
     public static let projectionFrameMarker: UInt8 = 0xfa
 
@@ -347,6 +444,162 @@ public enum SpinDisplayProtocol {
     public static func projectionFrameHeader(length: Int) -> [UInt8]? {
         guard (0..<(1 << 24)).contains(length) else { return nil }
         return [projectionFrameMarker, UInt8(length & 0xff), UInt8((length >> 8) & 0xff), UInt8((length >> 16) & 0xff)]
+    }
+
+    /// Original `Send.GetSpeed`: a read-only rotation-speed query with no payload.
+    /// Original `Send.LampTest`: 1 starts the LED test pattern, 0 ends it. The Test window powers the
+    /// fan off (`0x17 0`) and waits 100 ms before each lamp-test command.
+    public static func lampTestRequest(isOn: Bool) -> [UInt8] {
+        frame(command: lampTestCommand, payload: [isOn ? 1 : 0])
+    }
+
+    /// Original Test window raw sender: hex bytes (spaces ignored) with the CRC-16 appended.
+    /// Expects at least the header, command, and 2-byte length.
+    public static func rawPacket(hex: String) -> [UInt8]? {
+        let digits = hex.filter { !$0.isWhitespace }
+        guard !digits.isEmpty, digits.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        var index = digits.startIndex
+        while index < digits.endIndex {
+            let next = digits.index(index, offsetBy: 2)
+            guard let byte = UInt8(digits[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        guard bytes.count >= 4, bytes[0] == header else { return nil }
+        let checksum = crc16(bytes)
+        return bytes + [UInt8(checksum & 0xff), UInt8(checksum >> 8)]
+    }
+
+    /// Original `Send.FOTA`: announces a firmware payload of `length` bytes (file length minus the 8-byte
+    /// header). The fan answers 0 when ready for the data channel and 2 when the upgrade completes.
+    public static func firmwareUpdateRequest(length: Int) -> [UInt8]? {
+        guard length > 0, length <= Int(Int32.max) else { return nil }
+        let value = UInt32(length)
+        return frame(command: firmwareUpdateCommand, payload: [
+            UInt8(value & 0xff), UInt8((value >> 8) & 0xff), UInt8((value >> 16) & 0xff), UInt8(value >> 24)
+        ])
+    }
+
+    // MARK: - Sync groups and splicing
+
+    /// Original `Send.SetGroup`: group 0 (ungrouped) to 20; `isHost` only applies to a grouped fan.
+    public static func syncGroupRequest(group: Int, isHost: Bool) -> [UInt8]? {
+        guard (0...20).contains(group) else { return nil }
+        return frame(command: syncGroupCommand, payload: [UInt8(group), group != 0 && isHost ? 1 : 0])
+    }
+
+    /// Original `Send.SetCoord`: the fan's splicing position (x, y as little-endian 16-bit), level, and model.
+    public static func setCoordinateRequest(x: Int, y: Int, level: Int, model: Int) -> [UInt8] {
+        let x16 = UInt16(truncatingIfNeeded: x), y16 = UInt16(truncatingIfNeeded: y)
+        return frame(command: setCoordinateCommand, payload: [
+            UInt8(x16 & 0xff), UInt8(x16 >> 8), UInt8(y16 & 0xff), UInt8(y16 >> 8),
+            UInt8(truncatingIfNeeded: level), UInt8(truncatingIfNeeded: model)
+        ])
+    }
+
+    /// Original `Send.JointModel`: splicing (joint) display mode on or off.
+    public static func jointModeRequest(_ status: Int) -> [UInt8] {
+        frame(command: jointModeCommand, payload: [UInt8(truncatingIfNeeded: status)])
+    }
+
+    /// Original `Send.SelectDevice`: 1 highlights the fan (used while pointing at it in a layout), 0 clears it.
+    public static func selectDeviceRequest(isSelected: Bool) -> [UInt8] {
+        frame(command: selectDeviceCommand, payload: [isSelected ? 1 : 0])
+    }
+
+    // MARK: - LED transcoding and bin transfer (content types 3 and 1)
+
+    /// Original `Send.QueryTranscodingParameter`, sent at connect to content-type-3 fans.
+    public static func transcodingQuery() -> [UInt8] { frame(command: transcodingCommand) }
+
+    /// Original `Send.GetBinParam`, sent once to content-type-1 fans.
+    public static func binParameterQuery() -> [UInt8] { frame(command: binParameterCommand) }
+
+    /// Original `Send.NoticAudio`: sent after bin frames when no audio is available.
+    public static func noticeAudioRequest() -> [UInt8] { frame(command: noticeAudioCommand) }
+
+    /// Original `Send.BinSending`: name (20 UTF-8 bytes), frame duration in µs, frame count, audio flag,
+    /// then a random key byte; bytes 4–32 are XORed with the key.
+    public static func binSendRequest(name: String, frameDuration: Int, frames: Int, hasAudio: Bool, key: UInt8) -> [UInt8]? {
+        guard key != 0, frames > 0, frameDuration >= 0 else { return nil }
+        // TypeConversion.GetBytes(string, 20) truncates on a character boundary.
+        var trimmed = name
+        while trimmed.utf8.count > 20 { trimmed.removeLast() }
+        let nameBytes = Array(trimmed.utf8)
+        var payload = [UInt8](repeating: 0, count: 30)
+        payload.replaceSubrange(0..<nameBytes.count, with: nameBytes)
+        payload.replaceSubrange(20..<24, with: littleEndian32(frameDuration))
+        payload.replaceSubrange(24..<28, with: littleEndian32(frames))
+        payload[28] = hasAudio ? 1 : 0
+        payload[29] = key
+        for index in 0..<29 { payload[index] ^= key }
+        return frame(command: binSendCommand, payload: payload)
+    }
+
+    public static func parseTranscoding(_ frame: [UInt8]) -> FanTranscoding? {
+        guard frame.count >= 268, frame[0] == header, frame[1] == transcodingCommand else { return nil }
+        let ledCount = Int(Int16(bitPattern: UInt16(frame[4]) | UInt16(frame[5]) << 8))
+        let ratioEnd = min(frame.count, 268 + max(0, ledCount))
+        return FanTranscoding(
+            ledCount: ledCount,
+            rows: Int(Int16(bitPattern: UInt16(frame[6]) | UInt16(frame[7]) << 8)),
+            direction: Int(frame[8]),
+            deliveryTimes: Int(frame[9]),
+            lightBarCount: Int(frame[10]),
+            quality: Int(frame[11]),
+            adjust: Array(frame[12..<268]),
+            ratio: Array(frame[268..<ratioEnd])
+        )
+    }
+
+    public static func parseBinConfiguration(_ frame: [UInt8]) -> FanBinConfiguration? {
+        guard frame.count >= 273, frame[0] == header, frame[1] == binParameterCommand else { return nil }
+        let length = Int(Int16(bitPattern: UInt16(frame[2]) | UInt16(frame[3]) << 8))
+        guard length + 6 == frame.count else { return nil }
+        let lightCount = length - 266
+        let ledCount = Int(Int16(bitPattern: UInt16(frame[4]) | UInt16(frame[5]) << 8))
+        guard ledCount > 0 else { return nil }
+        var lights = [Double](repeating: 1, count: ledCount)
+        let offset = max(0, ledCount - lightCount)
+        for index in 0..<max(0, lightCount) where offset + index < ledCount {
+            lights[offset + index] = Double(frame[270 + index]) * 0.01
+        }
+        return FanBinConfiguration(
+            ledCount: ledCount,
+            subsection: Int(frame[6]),
+            lamps: Int(frame[7]),
+            rows: Int(Int16(bitPattern: UInt16(frame[8]) | UInt16(frame[9]) << 8)),
+            color: Int(frame[10]),
+            bit: Int(frame[11]),
+            orientation: Int(frame[12]),
+            perBar: Int(frame[13]),
+            adjust: Array(frame[14..<270]),
+            lights: lights
+        )
+    }
+
+    private static func littleEndian32(_ value: Int) -> [UInt8] {
+        let raw = UInt32(truncatingIfNeeded: value)
+        return [UInt8(raw & 0xff), UInt8((raw >> 8) & 0xff), UInt8((raw >> 16) & 0xff), UInt8(raw >> 24)]
+    }
+
+    public static func rotationSpeedRequest() -> [UInt8] {
+        frame(command: rotationSpeedCommand)
+    }
+
+    /// Original `Receive.GetSpeed`: payload bytes 0–3 are a little-endian value.
+    public static func parseRotationSpeedValue(_ frame: [UInt8]) -> Int? {
+        guard frame.count >= 10, frame[0] == header, frame[1] == rotationSpeedCommand else { return nil }
+        return Int(Int32(bitPattern: UInt32(frame[4]) | UInt32(frame[5]) << 8 | UInt32(frame[6]) << 16 | UInt32(frame[7]) << 24))
+    }
+
+    /// The original Test window's display, `60,000,000 / value` (0 when the value is 0). It treats the
+    /// value as microseconds per revolution, but on the user's fan the value is about 680 while running and
+    /// falls to 0 after power-off, so it behaves like RPM and this formula does not apply.
+    public static func parseRotationSpeedRPM(_ frame: [UInt8]) -> Int? {
+        guard let value = parseRotationSpeedValue(frame) else { return nil }
+        return value == 0 ? 0 : 60_000_000 / value
     }
 
     public static func powerRequest(isOn: Bool) -> [UInt8] {
