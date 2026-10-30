@@ -48,7 +48,14 @@ Fans reporting content type 3, or device types 25/26, need the original's LED "m
 3. Each frame is a 4:2:0 quality-30 JPEG prefixed with `FA` and a 3-byte little-endian length.
 4. Stopping sends `0x37 (0)` and closes the data channel.
 
-Capture uses ScreenCaptureKit, so macOS asks for Screen Recording permission. Uploads and projection exclude each other. Projection has not been tested on hardware.
+The Mac adds several controls the original lacked; changes apply live while projecting:
+- **Source:** a screen area on any display, or a single window. The window is followed when it moves and is captured even when partly covered.
+- **Screen area:** a Size slider, plus an orange on-screen capture frame. The frame is shown while the Projection tab is open or projecting; drag it to move the area and scroll over it to resize. It is excluded from the capture.
+- **Window framing:** Fill/Fit with zoom and position sliders.
+- **Preview:** a live circle in the app shows what is being sent.
+- **Center:** restores the original's centered area.
+
+Capture uses ScreenCaptureKit, so macOS asks for Screen Recording permission. Because the app bundle is ad-hoc signed, macOS may ask again after each rebuild. Uploads and projection exclude each other. Projection has not been tested on hardware.
 
 **Experimental (locked behind a checkbox, untested):** factory reset (`0x19 0x55`), remote-control pairing (`0x22`, start 0 / cancel 1; the fan answers 2 when matched), and router disconnect (`0x07` with flag 0). Firmware updates are not available: the original downloads packages from the manufacturer's server, and a failed update could leave the fan unusable.
 

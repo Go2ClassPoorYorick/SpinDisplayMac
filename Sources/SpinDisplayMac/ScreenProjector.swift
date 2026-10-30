@@ -56,9 +56,10 @@ final class ScreenProjector: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Applies a new source while running. Moving or resizing within the same display or window only
     /// updates the configuration; changing display or window also swaps the content filter.
-    func update(source newSource: ProjectionSource, excludingWindowIDs: [CGWindowID]) async throws {
+    /// `forceFilter` re-applies the content filter, for example to exclude a newly shown overlay window.
+    func update(source newSource: ProjectionSource, excludingWindowIDs: [CGWindowID], forceFilter: Bool = false) async throws {
         let (stream, oldSource) = stateLock.withLock { (self.stream, self.source) }
-        guard let stream, newSource != oldSource else { return }
+        guard let stream, forceFilter || newSource != oldSource else { return }
         stateLock.withLock { self.source = newSource }
         let sameTarget: Bool
         switch (oldSource, newSource) {
@@ -66,11 +67,11 @@ final class ScreenProjector: NSObject, SCStreamOutput, SCStreamDelegate {
         case (.window(let a, _)?, .window(let b, _)): sameTarget = a == b
         default: sameTarget = false
         }
-        if case .window = newSource, sameTarget { return }  // window crops are applied per frame
+        if case .window = newSource, sameTarget, !forceFilter { return }  // window crops are applied per frame
         let (filter, configuration) = try await Self.makeFilterAndConfiguration(
             for: newSource, imageSize: imageSize, maxFPS: maxFPS, excludingWindowIDs: excludingWindowIDs
         )
-        if !sameTarget { try await stream.updateContentFilter(filter) }
+        if !sameTarget || forceFilter { try await stream.updateContentFilter(filter) }
         try await stream.updateConfiguration(configuration)
     }
 

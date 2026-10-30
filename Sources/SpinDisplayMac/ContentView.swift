@@ -54,7 +54,29 @@ final class DeviceViewModel: ObservableObject {
     @Published var projectionMessage = "Mirrors the center of your main display onto the fan."
     @Published var projectionFramesSent = 0
     @Published var projectionFPS = 0.0
+    @Published var projectionSourceKind: ProjectionSourceKind = .area
+    @Published var projectionDisplays: [ProjectionSources.Display] = []
+    @Published var projectionWindows: [ProjectionSources.Window] = []
+    @Published var projectionDisplayID: CGDirectDisplayID?
+    @Published var projectionAreaRect: CGRect?
+    @Published var projectionWindowID: CGWindowID?
+    @Published var projectionCrop = MediaConverter.Crop()
+    @Published var showCaptureFrame = true
+    @Published var projectionPreview: CGImage?
+    /// The capture frame is shown only while the Projection tab is open or a projection is running.
+    var projectionPageVisible = false {
+        didSet { updateCaptureOverlay() }
+    }
     private var projector: ScreenProjector?
+    private var captureOverlay: CaptureOverlay?
+    private var sourceUpdateInFlight = false
+    private var sourceUpdatePending = false
+
+    enum ProjectionSourceKind: String, CaseIterable, Identifiable {
+        case area
+        case window
+        var id: String { rawValue }
+    }
     private var projectionCounterTimer: Timer?
     private let projectionCounter = FrameCounter()
 
@@ -119,7 +141,18 @@ final class DeviceViewModel: ObservableObject {
         versionInfo?.model != 1 && deviceInfo?.restrictions.contains(.timingPlay) != true
     }
 
+    private var terminationObserver: NSObjectProtocol?
+
     init() {
+        // On quit, end projection on the fan (0x37 0) and close the control connection cleanly.
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.stopProjection()
+                self?.disconnect()
+            }
+        }
         scanner.onDevice = { [weak self] device in
             Task { @MainActor in
                 guard let self else { return }
@@ -202,6 +235,128 @@ final class DeviceViewModel: ObservableObject {
         return conversionUnsupportedReason
     }
 
+    /// Lists displays and windows (this also triggers the Screen Recording prompt the first time).
+    func loadProjectionSources() {
+        Task {
+            do {
+                let sources = try await ProjectionSources.load()
+                projectionDisplays = sources.displays
+                projectionWindows = sources.windows
+                if projectionDisplayID == nil || !sources.displays.contains(where: { $0.id == projectionDisplayID }) {
+                    let main = sources.displays.first { $0.id == CGMainDisplayID() } ?? sources.displays.first
+                    projectionDisplayID = main?.id
+                    projectionAreaRect = nil
+                }
+                if let windowID = projectionWindowID, !sources.windows.contains(where: { $0.id == windowID }) {
+                    projectionWindowID = nil
+                }
+                if projectionWindowID == nil { projectionWindowID = sources.windows.first?.id }
+                if projectionAreaRect == nil { resetProjectionArea() } else { projectionSourceChanged() }
+            } catch {
+                projectionMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private var selectedDisplay: ProjectionSources.Display? {
+        projectionDisplays.first { $0.id == projectionDisplayID }
+    }
+
+    var currentProjectionSource: ProjectionSource? {
+        switch projectionSourceKind {
+        case .area:
+            guard let id = projectionDisplayID, let rect = projectionAreaRect else { return nil }
+            return .displayArea(displayID: id, rect: rect)
+        case .window:
+            guard let id = projectionWindowID else { return nil }
+            return .window(windowID: id, crop: projectionCrop)
+        }
+    }
+
+    /// The original's default: a centered square of the display's shorter side, at most 1024 points.
+    func resetProjectionArea() {
+        guard let display = selectedDisplay else { return }
+        projectionAreaRect = ScreenProjector.captureRect(screenWidth: display.size.width, screenHeight: display.size.height)
+        projectionSourceChanged()
+    }
+
+    /// Resizes the capture square around its center, keeping it on the display.
+    func setProjectionAreaSize(_ side: CGFloat) {
+        guard let display = selectedDisplay, let rect = projectionAreaRect else { return }
+        let clamped = min(max(side, 120), min(display.size.width, display.size.height))
+        var resized = CGRect(x: rect.midX - clamped / 2, y: rect.midY - clamped / 2, width: clamped, height: clamped)
+        resized.origin.x = min(max(resized.minX, 0), display.size.width - clamped)
+        resized.origin.y = min(max(resized.minY, 0), display.size.height - clamped)
+        projectionAreaRect = resized
+        projectionSourceChanged()
+    }
+
+    func setProjectionCrop(_ crop: MediaConverter.Crop) {
+        var adjusted = crop
+        adjusted.zoom = min(max(adjusted.zoom, MediaConverter.Crop.zoomRange.lowerBound), MediaConverter.Crop.zoomRange.upperBound)
+        adjusted.centerX = min(max(adjusted.centerX, 0), 1)
+        adjusted.centerY = min(max(adjusted.centerY, 0), 1)
+        projectionCrop = adjusted
+        projectionSourceChanged()
+    }
+
+    /// Updates the on-screen frame and, while projecting, the running capture.
+    func projectionSourceChanged() {
+        updateCaptureOverlay()
+        pushProjectionSource()
+    }
+
+    private func updateCaptureOverlay() {
+        guard showCaptureFrame, projectionSourceKind == .area, projectionPageVisible || isProjecting,
+              let id = projectionDisplayID, let rect = projectionAreaRect,
+              let screen = NSScreenLookup.screen(for: id) else {
+            captureOverlay?.close()
+            captureOverlay = nil
+            return
+        }
+        if let captureOverlay {
+            captureOverlay.update(screen: screen, rect: rect)
+        } else {
+            let overlay = CaptureOverlay(screen: screen, rect: rect)
+            overlay.onChange = { [weak self] rect in
+                guard let self else { return }
+                self.projectionAreaRect = rect
+                self.pushProjectionSource()
+            }
+            captureOverlay = overlay
+            // The overlay must be excluded from a capture that is already running.
+            pushProjectionSource(force: true)
+        }
+    }
+
+    private var excludedWindowIDs: [CGWindowID] {
+        captureOverlay.map { [$0.windowID] } ?? []
+    }
+
+    /// Applies the current source to the running capture, coalescing rapid changes such as drags.
+    private func pushProjectionSource(force: Bool = false) {
+        guard isProjecting, let projector, let source = currentProjectionSource else { return }
+        if sourceUpdateInFlight {
+            sourceUpdatePending = true
+            return
+        }
+        sourceUpdateInFlight = true
+        let excluded = excludedWindowIDs
+        Task {
+            do {
+                if force { try await projector.update(source: source, excludingWindowIDs: excluded, forceFilter: true) }
+                else { try await projector.update(source: source, excludingWindowIDs: excluded) }
+            } catch {
+                projectionMessage = error.localizedDescription
+            }
+            sourceUpdateInFlight = false
+            if sourceUpdatePending {
+                sourceUpdatePending = false
+                pushProjectionSource()
+            }
+        }
+    }
+
     func startProjection() {
         guard isConnected, let connection else {
             projectionMessage = "Connect to the fan before projecting."
@@ -216,6 +371,13 @@ final class DeviceViewModel: ObservableObject {
             return
         }
         guard !isProjecting, !isStartingProjection else { return }
+        guard currentProjectionSource != nil else {
+            projectionMessage = projectionSourceKind == .window
+                ? "Choose a window to project (press Refresh to list windows)."
+                : "Choose a display to project (press Refresh to list displays)."
+            loadProjectionSources()
+            return
+        }
         isStartingProjection = true
         projectionMessage = "Asking the fan to start projection (retrying every 2 s for up to 30 s)…"
         let connectionID = connection.id
@@ -244,8 +406,12 @@ final class DeviceViewModel: ObservableObject {
         projector.onStopped = { [weak self] message in
             Task { @MainActor in self?.stopProjection(message: message) }
         }
+        projector.onPreview = { [weak self] image in
+            Task { @MainActor in self?.projectionPreview = image }
+        }
         do {
-            try await projector.start()
+            guard let source = currentProjectionSource else { throw ScreenProjector.ProjectionError.noDisplay }
+            try await projector.start(source: source, excludingWindowIDs: excludedWindowIDs)
         } catch {
             connection.stopProjection()
             isStartingProjection = false
@@ -255,9 +421,12 @@ final class DeviceViewModel: ObservableObject {
         self.projector = projector
         isStartingProjection = false
         isProjecting = true
+        updateCaptureOverlay()
         projectionFramesSent = 0
         projectionFPS = 0
-        projectionMessage = "Projecting. The fan shows the center square of your main display."
+        projectionMessage = projectionSourceKind == .area
+            ? "Projecting the framed area. Drag the orange frame to move it, scroll over it to resize."
+            : "Projecting the selected window. It is followed if you move it."
         projectionCounterTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -283,6 +452,9 @@ final class DeviceViewModel: ObservableObject {
         isProjecting = false
         isStartingProjection = false
         projectionFPS = 0
+        projectionPreview = nil
+        sourceUpdatePending = false
+        updateCaptureOverlay()
     }
 
     /// Fills the editable settings from the fan once per connection so periodic refreshes don't overwrite edits.
@@ -1471,48 +1643,187 @@ struct ContentView: View {
     }
 
     private var projectionPage: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if !model.isConnected {
-                disconnectedNotice
-            }
-            GroupBox("Screen projection") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Streams a centered square of your main display (its shorter side, at most 1024 points) to the fan, as the original app did. Frames are \(model.conversionTarget.imageSize)×\(model.conversionTarget.imageSize) JPEGs at quality 30, up to \(model.conversionTarget.maxFPS) fps.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("macOS asks for Screen Recording permission the first time. After allowing it, you may need to quit and reopen the app.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if let reason = model.projectionUnsupportedReason {
-                        Text(reason)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                    HStack {
-                        if model.isProjecting {
-                            Label("\(Int(model.projectionFPS)) fps  •  \(model.projectionFramesSent) frames", systemImage: "dot.radiowaves.left.and.right")
-                                .monospacedDigit()
-                        } else if model.isStartingProjection {
-                            ProgressView().controlSize(.small)
-                        }
-                        Spacer()
-                        if model.isProjecting || model.isStartingProjection {
-                            Button("Stop projection", role: .destructive) { model.stopProjection() }
-                        } else {
-                            Button("Start projection") { model.startProjection() }
-                                .disabled(!model.isConnected || model.isUploadingFTLV || model.projectionUnsupportedReason != nil)
-                        }
-                    }
-                    Text(model.projectionMessage)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if !model.isConnected {
+                    disconnectedNotice
                 }
-                .padding(.vertical, 4)
+                GroupBox("Screen projection") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Streams part of your screen to the fan as \(model.conversionTarget.imageSize)×\(model.conversionTarget.imageSize) JPEGs at quality 30, up to \(model.conversionTarget.maxFPS) fps, like the original app. macOS asks for Screen Recording permission the first time; after allowing it you may need to reopen the app.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let reason = model.projectionUnsupportedReason {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                        HStack(alignment: .top, spacing: 18) {
+                            projectionPreview
+                            projectionSourceControls
+                        }
+                        HStack {
+                            if model.isProjecting {
+                                Label("\(Int(model.projectionFPS)) fps  •  \(model.projectionFramesSent) frames", systemImage: "dot.radiowaves.left.and.right")
+                                    .monospacedDigit()
+                            } else if model.isStartingProjection {
+                                ProgressView().controlSize(.small)
+                            }
+                            Spacer()
+                            if model.isProjecting || model.isStartingProjection {
+                                Button("Stop projection", role: .destructive) { model.stopProjection() }
+                            } else {
+                                Button("Start projection") { model.startProjection() }
+                                    .disabled(!model.isConnected || model.isUploadingFTLV || model.projectionUnsupportedReason != nil)
+                            }
+                        }
+                        Text(model.projectionMessage)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .padding(.vertical, 4)
+                }
             }
-            Spacer()
+            .padding(.vertical, 8)
         }
-        .padding(.vertical, 8)
+        .onAppear {
+            model.projectionPageVisible = true
+            if model.projectionDisplays.isEmpty { model.loadProjectionSources() }
+        }
+        .onDisappear { model.projectionPageVisible = false }
+    }
+
+    private var projectionPreview: some View {
+        ZStack {
+            Circle().fill(Color.black)
+            if let image = model.projectionPreview {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .clipShape(Circle())
+            } else {
+                Text(model.isProjecting ? "Waiting for frames…" : "Preview appears while projecting")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(24)
+            }
+        }
+        .frame(width: 200, height: 200)
+    }
+
+    private var projectionSourceControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Picker("Source", selection: Binding(
+                    get: { model.projectionSourceKind },
+                    set: { model.projectionSourceKind = $0; model.projectionSourceChanged() }
+                )) {
+                    Text("Screen area").tag(DeviceViewModel.ProjectionSourceKind.area)
+                    Text("Window").tag(DeviceViewModel.ProjectionSourceKind.window)
+                }
+                .pickerStyle(.segmented)
+                Button("Refresh") { model.loadProjectionSources() }
+                    .help("Reload the list of displays and windows")
+            }
+            switch model.projectionSourceKind {
+            case .area:
+                Picker("Display", selection: Binding(
+                    get: { model.projectionDisplayID ?? 0 },
+                    set: { model.projectionDisplayID = $0; model.resetProjectionArea() }
+                )) {
+                    ForEach(model.projectionDisplays) { display in
+                        Text(display.name).tag(display.id)
+                    }
+                }
+                if let rect = model.projectionAreaRect,
+                   let display = model.projectionDisplays.first(where: { $0.id == model.projectionDisplayID }) {
+                    let maximum = max(121, min(display.size.width, display.size.height))
+                    HStack {
+                        Text("Size")
+                        Slider(value: Binding(
+                            get: { Double(rect.width) },
+                            set: { model.setProjectionAreaSize(CGFloat($0)) }
+                        ), in: 120...Double(maximum))
+                        Text("\(Int(rect.width)) pt")
+                            .monospacedDigit()
+                            .frame(width: 56, alignment: .trailing)
+                    }
+                }
+                HStack {
+                    Toggle("Show capture frame", isOn: Binding(
+                        get: { model.showCaptureFrame },
+                        set: { model.showCaptureFrame = $0; model.projectionSourceChanged() }
+                    ))
+                    Spacer()
+                    Button("Center") { model.resetProjectionArea() }
+                        .help("Restore the original app's area: a centered square, at most 1024 points")
+                }
+                Text("Drag the orange frame on screen to move the area; scroll over it to resize.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .window:
+                Picker("Window", selection: Binding(
+                    get: { model.projectionWindowID ?? 0 },
+                    set: { model.projectionWindowID = $0; model.projectionSourceChanged() }
+                )) {
+                    ForEach(model.projectionWindows) { window in
+                        Text(window.title).lineLimit(1).tag(window.id)
+                    }
+                }
+                Picker("Framing", selection: Binding(
+                    get: { model.projectionCrop.framing },
+                    set: { model.setProjectionCrop(MediaConverter.Crop(framing: $0)) }
+                )) {
+                    Text("Fill circle").tag(MediaConverter.Framing.fill)
+                    Text("Fit whole window").tag(MediaConverter.Framing.fit)
+                }
+                .pickerStyle(.segmented)
+                HStack {
+                    Text("Zoom")
+                    Slider(value: Binding(
+                        get: { model.projectionCrop.zoom },
+                        set: { zoom in
+                            var crop = model.projectionCrop
+                            crop.zoom = zoom
+                            model.setProjectionCrop(crop)
+                        }
+                    ), in: MediaConverter.Crop.zoomRange)
+                    Text(String(format: "%.1f×", model.projectionCrop.zoom))
+                        .monospacedDigit()
+                        .frame(width: 36, alignment: .trailing)
+                }
+                HStack {
+                    Text("Horizontal")
+                    Slider(value: Binding(
+                        get: { model.projectionCrop.centerX },
+                        set: { x in
+                            var crop = model.projectionCrop
+                            crop.centerX = x
+                            model.setProjectionCrop(crop)
+                        }
+                    ), in: 0...1)
+                }
+                HStack {
+                    Text("Vertical")
+                    Slider(value: Binding(
+                        get: { model.projectionCrop.centerY },
+                        set: { y in
+                            var crop = model.projectionCrop
+                            crop.centerY = y
+                            model.setProjectionCrop(crop)
+                        }
+                    ), in: 0...1)
+                    Button("Reset") { model.setProjectionCrop(MediaConverter.Crop(framing: model.projectionCrop.framing)) }
+                        .controlSize(.small)
+                }
+                Text("The window is followed if you move it, and captured even when partly covered.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var wifiPage: some View {
