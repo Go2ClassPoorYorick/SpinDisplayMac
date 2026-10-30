@@ -1,6 +1,17 @@
 # SpinDisplay for macOS
 
-This is a native SwiftUI macOS app based on static analysis of the supplied Windows application. It has no CrossOver or Wine runtime dependency.
+This is a native SwiftUI macOS app for SpinDisplay holographic fans. It has no CrossOver or Wine runtime dependency.
+
+## Provenance
+
+This app is an independent macOS rebuild of the Windows **SpinDisplay 2.0.1.1** client, made for interoperability with SpinDisplay holographic fans. No original source code was available. Its behavior was reverse-engineered from the original's compiled Windows application:
+- The .NET assembly (`SpinDisplay.exe`) was disassembled to IL, and command layouts, encodings, and UI behavior were traced from it.
+- Static analysis with REA (Ghidra provider) was run on the same binary. It identified the app as managed .NET code; the detailed protocol work came from the IL.
+- Behavior was checked on a physical fan where possible. The README notes which features are hardware-confirmed.
+
+No code, binaries, firmware, or documents from the original application are included in this repository. Its manual (`help.pdf`) is copyrighted and only bundled into local builds from a user-supplied copy.
+
+AI assistants were used at different points in development: **Claude** (Anthropic), **ChatGPT** (OpenAI), and **Gemini** (Google).
 
 ## Build and run
 
