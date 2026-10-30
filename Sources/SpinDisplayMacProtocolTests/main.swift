@@ -1,5 +1,8 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import SpinDisplayCore
+import SpinDisplayMedia
 
 @main
 enum SpinDisplayProtocolTests {
@@ -20,6 +23,9 @@ enum SpinDisplayProtocolTests {
         testChangeFileRequest()
         testDeviceInfo()
         testVersionAndStatusResponses()
+        testFTLVWriter()
+        testFTLVTimingAndAudio()
+        testBaselineJPEGEncoder()
         print("All SpinDisplay protocol tests passed.")
     }
 
@@ -104,8 +110,8 @@ enum SpinDisplayProtocolTests {
         precondition(Array(play[4..<6]) == [1, 3])
         let repeatRequests = SpinDisplayProtocol.repeatFileRequests(index: 3)
         precondition(repeatRequests.count == 2)
-        precondition(Array(repeatRequests[0][4..<6]) == [2, 3])
-        precondition(Array(repeatRequests[1][4..<6]) == [1, 3])
+        precondition(Array(repeatRequests[0][4..<6]) == [1, 3])
+        precondition(Array(repeatRequests[1][4..<6]) == [2, 3])
 
         let playbackStatusQuery = SpinDisplayProtocol.playControlRequest(control: 0, index: 0)
         precondition(playbackStatusQuery[1] == SpinDisplayProtocol.playControlCommand)
@@ -189,8 +195,12 @@ enum SpinDisplayProtocolTests {
     private static func testFileManagementRequests() {
         let delete = SpinDisplayProtocol.deleteFileRequest(index: 4)
         precondition(delete?[1] == SpinDisplayProtocol.deleteFileCommand)
-        precondition(Array(delete![4..<6]) == [0, 4])
+        precondition(Array(delete![4..<6]) == [0, 5])
+        precondition(Array(SpinDisplayProtocol.deleteFileRequest(index: 0)![4..<6]) == [0, 1])
+        precondition(Array(SpinDisplayProtocol.deleteFileRequest(index: 254)![4..<6]) == [0, 255])
         precondition(SpinDisplayProtocol.deleteFileRequest(index: 255) == nil)
+        // Original Settings "Search and connect" Bluetooth-speaker button: BleVolumeSetting(2, 0).
+        precondition(Array(SpinDisplayProtocol.bleVolumeRequest(control: 2)[4..<6]) == [2, 0])
 
         let move = SpinDisplayProtocol.moveFileRequest(from: 4, to: 2)
         precondition(move?[1] == SpinDisplayProtocol.moveFileCommand)
@@ -474,5 +484,132 @@ enum SpinDisplayProtocolTests {
         let ack = SpinDisplayProtocol.frame(command: SpinDisplayProtocol.displayModeCommand, payload: [0])
         precondition(SpinDisplayProtocol.parseSettingStatus(ack, command: SpinDisplayProtocol.displayModeCommand) == 0)
         precondition(SpinDisplayProtocol.parseSettingStatus(ack, command: SpinDisplayProtocol.changeFileCommand) == nil)
+    }
+
+    // Layout follows the original FTLV class: 512-byte header area, 4-byte-padded blocks,
+    // index header A5 00…, (offset, unpadded length) pairs, totaltime in seconds.
+    private static func testFTLVWriter() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("spindisplay-test-\(UUID().uuidString).ftlv")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try! FTLVWriter(url: url, magic: .standard, frameDuration: 50_000)
+        try! writer.appendVideoFrame(Data([0xff, 0xd8, 1, 2, 3, 0xff, 0xd9]), duration: 600_000)
+        try! writer.appendVideoFrame(Data([0xff, 0xd8, 0xff, 0xd9]), duration: 600_000)
+        try! writer.appendAudio(Data([128, 129, 130]))
+        let header = try! writer.finish()
+        precondition((try? writer.finish()) == nil)
+
+        let bytes = [UInt8](try! Data(contentsOf: url))
+        precondition(header.count == 48)
+        precondition(Array(bytes.prefix(48)) == header)
+        precondition(bytes[48..<512].allSatisfy { $0 == 0 })
+        precondition(Array(header[0..<8]) == Array("FTLV".utf8) + [1, 0, 0, 0])
+        // frames: 7 -> 8 bytes at 512, 4 bytes at 520; audio: 3 -> 4 bytes at 524; index at 528
+        precondition(bytes.count == 528 + 8 + 3 * 8)
+        precondition(Array(bytes[512..<520]) == [0xff, 0xd8, 1, 2, 3, 0xff, 0xd9, 0])
+        precondition(Array(bytes[524..<528]) == [128, 129, 130, 0])
+        precondition(Array(bytes[528..<536]) == [0xa5, 0, 0, 0, 0, 0, 0, 0])
+        precondition(Array(bytes[536..<560]) == [0, 2, 0, 0, 7, 0, 0, 0, 8, 2, 0, 0, 4, 0, 0, 0, 12, 2, 0, 0, 3, 0, 0, 0])
+
+        guard let contents = FTLVContents.parse(bytes) else { preconditionFailure("FTLV reread") }
+        precondition(contents.info.fileLength == 560 && contents.info.headerLength == 512)
+        precondition(contents.info.dataLength == 12 && contents.info.audioLength == 4 && contents.info.indexLength == 32)
+        precondition(contents.info.frameDuration == 50_000 && contents.info.frameCount == 2)
+        precondition(contents.totalSeconds == 1)
+        precondition(contents.videoBlocks.count == 2)
+        precondition(contents.audioBlock == FTLVContents.Block(offset: 524, length: 3))
+        precondition(contents.info.isCompatible(with: 1))
+
+        let typedURL = url.deletingLastPathComponent().appendingPathComponent("spindisplay-typed-\(UUID().uuidString).ftlv")
+        defer { try? FileManager.default.removeItem(at: typedURL) }
+        let typed = try! FTLVWriter(url: typedURL, magic: .deviceTyped(7), frameDuration: FTLVWriter.stillImageFrameDuration)
+        try! typed.appendVideoFrame(Data([1, 2, 3, 4]), duration: FTLVWriter.stillImageFrameDuration)
+        let typedHeader = try! typed.finish()
+        precondition(Array(typedHeader[0..<4]) == Array("FTL".utf8) + [7])
+        precondition(Array(typedHeader[36..<48]) == [0x80, 0x96, 0x98, 0, 1, 0, 0, 0, 10, 0, 0, 0])
+    }
+
+    private static func testFTLVTimingAndAudio() {
+        // SendWindow: min(source fps, max_fps), 20 outside 1...60; TcpServer: 1000 / (1000 / fps).
+        precondition(FTLVTiming.videoFPS(sourceFPS: 29.97, maxFPS: 20) == 20)
+        precondition(FTLVTiming.videoFPS(sourceFPS: 12, maxFPS: 20) == 12)
+        precondition(FTLVTiming.videoFPS(sourceFPS: 30, maxFPS: 0) == 20)
+        precondition(FTLVTiming.videoFPS(sourceFPS: 0.5, maxFPS: 20) == 20)
+        precondition(FTLVTiming.effectiveFPS(24) == 24 && FTLVTiming.frameDuration(fps: 24) == 41_666)
+        precondition(FTLVTiming.effectiveFPS(7) == 7)
+        precondition(FTLVTiming.frameDuration(fps: 20) == 50_000)
+        precondition(FTLVWriter.paddedLength(0) == 0 && FTLVWriter.paddedLength(5) == 8 && FTLVWriter.paddedLength(8) == 8)
+
+        // FFmpeg S16 -> U8: (sample >> 8) + 128
+        precondition(MediaConverter.pcm16ToUnsigned8([0x00, 0x00, 0xff, 0x7f, 0x00, 0x80, 0xff, 0xff]) == [128, 255, 0, 127])
+
+        let fill = MediaConverter.cropSquare(width: 1920, height: 1080, framing: .fill)
+        precondition(fill == CGRect(x: 420, y: 0, width: 1080, height: 1080))
+        let fit = MediaConverter.cropSquare(width: 1920, height: 1080, framing: .fit)
+        precondition(fit == CGRect(x: 0, y: -420, width: 1920, height: 1920))
+        precondition(MediaConverter.unsupportedReason(deviceType: 25, contentType: 0) != nil)
+        precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 3) != nil)
+        precondition(MediaConverter.unsupportedReason(deviceType: 1, contentType: 1) == nil)
+
+        // Original trims to whole seconds; holding the last frame rounds up instead.
+        precondition(MediaConverter.availableSeconds(duration: 7.152, holdLastFrame: false) == 7)
+        precondition(MediaConverter.availableSeconds(duration: 7.152, holdLastFrame: true) == 8)
+        precondition(MediaConverter.availableSeconds(duration: 7.0004, holdLastFrame: true) == 7)
+        precondition(MediaConverter.availableSeconds(duration: 0.4, holdLastFrame: false) == 1)
+        precondition(MediaConverter.availableSeconds(duration: .nan, holdLastFrame: true) == 1)
+    }
+
+    // The original encodes frames with libjpeg-turbo: baseline, 4:4:4, quality 80, JFIF only, no restarts.
+    private static func testBaselineJPEGEncoder() {
+        precondition(BaselineJPEGEncoder.scaledTable(BaselineJPEGEncoder.standardLuminance, quality: 80).prefix(3) == [6, 4, 4])
+        precondition(BaselineJPEGEncoder.scaledTable(BaselineJPEGEncoder.standardLuminance, quality: 50) == BaselineJPEGEncoder.standardLuminance)
+        precondition(BaselineJPEGEncoder.acLuminance.values.count == 162 && BaselineJPEGEncoder.acChrominance.values.count == 162)
+
+        let width = 37, height = 21  // not multiples of 8, to exercise edge padding
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                pixels[offset] = UInt8(x * 255 / (width - 1))
+                pixels[offset + 1] = UInt8(y * 255 / (height - 1))
+                pixels[offset + 2] = UInt8((x + y) % 2 == 0 ? 200 : 40)
+            }
+        }
+        let jpeg = [UInt8](BaselineJPEGEncoder.encode(rgba: pixels, width: width, height: height, quality: 80))
+
+        var markers: [UInt8] = []
+        var index = 2
+        while index + 3 < jpeg.count, jpeg[index] == 0xff {
+            markers.append(jpeg[index + 1])
+            if jpeg[index + 1] == 0xda { break }
+            index += 2 + (Int(jpeg[index + 2]) << 8 | Int(jpeg[index + 3]))
+        }
+        precondition(Array(jpeg.prefix(2)) == [0xff, 0xd8] && Array(jpeg.suffix(2)) == [0xff, 0xd9])
+        precondition(markers == [0xe0, 0xdb, 0xdb, 0xc0, 0xc4, 0xc4, 0xc4, 0xc4, 0xda])
+        let sof = jpeg.firstIndex(of: 0xc0).map { $0 - 1 }!
+        precondition(Array(jpeg[(sof + 10)..<(sof + 19)]) == [1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1])
+        let entropy = jpeg[(index + 14)..<(jpeg.count - 2)]
+        precondition(!zip(entropy, entropy.dropFirst()).contains { $0 == 0xff && (0xd0...0xd7).contains($1) })
+
+        // Decode with ImageIO and require a close match (mean absolute error per channel).
+        guard let source = CGImageSourceCreateWithData(Data(jpeg) as CFData, nil),
+              let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              decoded.width == width, decoded.height == height else {
+            preconditionFailure("encoded JPEG did not decode")
+        }
+        var roundTrip = [UInt8](repeating: 0, count: width * height * 4)
+        roundTrip.withUnsafeMutableBytes { buffer in
+            let context = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                    bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            context.draw(decoded, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        var totalError = 0, samples = 0
+        for pixel in 0..<(width * height) {
+            for channel in 0..<3 {
+                totalError += abs(Int(pixels[pixel * 4 + channel]) - Int(roundTrip[pixel * 4 + channel]))
+                samples += 1
+            }
+        }
+        precondition(Double(totalError) / Double(samples) < 12, "JPEG round-trip error too high")
     }
 }

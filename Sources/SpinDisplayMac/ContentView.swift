@@ -1,5 +1,7 @@
+import AppKit
 import SwiftUI
 import SpinDisplayCore
+import SpinDisplayMedia
 import UniformTypeIdentifiers
 
 @MainActor
@@ -42,6 +44,32 @@ final class DeviceViewModel: ObservableObject {
     @Published var loginPassword = ""
     @Published var showDeleteAllConfirmation = false
     @Published var fileEditor: FileEditorState?
+    @Published var mediaConversion: MediaConversionState?
+    @Published var showMediaImporter = false
+
+    final class Cancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        var isCancelled: Bool { lock.withLock { cancelled } }
+        func cancel() { lock.withLock { cancelled = true } }
+    }
+
+    struct MediaConversionState: Identifiable {
+        let id = UUID()
+        let sourceURL: URL
+        let hasSecurityScope: Bool
+        let kind: MediaConverter.MediaKind
+        var framing: MediaConverter.Framing = .fill
+        var includeAudio = true
+        var startSecond = 0
+        var endSecond: Int?
+        var holdLastFrame = true
+        var preview: CGImage?
+        var isWorking = false
+        var progress = 0.0
+        var message = ""
+        let cancellation = Cancellation()
+    }
 
     struct FileEditorState: Identifiable {
         let index: Int
@@ -387,20 +415,33 @@ final class DeviceViewModel: ObservableObject {
             }
             return
         }
+        let hasSecurityScope = url.startAccessingSecurityScopedResource()
+        startUpload(of: url, validatingMessage: "Validating FTLV file…") {
+            if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+        }
+    }
+
+    /// Uploads an FTLV file with the recovered 0x30/0x36 transfer; `cleanup` runs when the transfer ends.
+    @discardableResult
+    private func startUpload(of url: URL, validatingMessage: String, cleanup: @escaping () -> Void) -> Bool {
         guard isConnected, let connection else {
             ftlvUploadMessage = "Connect to the fan before uploading media."
-            return
+            cleanup()
+            return false
         }
         guard let device = connectedDevice else {
             ftlvUploadMessage = "Select the fan from discovery before uploading so its device type can be checked."
-            return
+            cleanup()
+            return false
         }
-        guard !isUploadingFTLV else { return }
+        guard !isUploadingFTLV else {
+            cleanup()
+            return false
+        }
 
-        let hasSecurityScope = url.startAccessingSecurityScopedResource()
         isUploadingFTLV = true
         ftlvUploadProgress = 0
-        ftlvUploadMessage = "Validating FTLV file…"
+        ftlvUploadMessage = validatingMessage
         let connectionID = connection.id
         connection.uploadFTLV(
             at: url,
@@ -414,9 +455,7 @@ final class DeviceViewModel: ObservableObject {
             },
             completion: { [weak self] result in
                 Task { @MainActor in
-                    if hasSecurityScope {
-                        url.stopAccessingSecurityScopedResource()
-                    }
+                    cleanup()
                     guard let self, self.connection?.id == connectionID else { return }
                     self.isUploadingFTLV = false
                     switch result {
@@ -429,6 +468,169 @@ final class DeviceViewModel: ObservableObject {
                 }
             }
         )
+        return true
+    }
+
+    // MARK: - Media conversion
+
+    var conversionTarget: MediaConverter.Target {
+        guard let info = deviceInfo else { return .generic }
+        return MediaConverter.Target(imageSize: info.imageSize, maxFPS: info.maxFPS)
+    }
+
+    var conversionUnsupportedReason: String? {
+        MediaConverter.unsupportedReason(deviceType: connectedDevice?.deviceType, contentType: deviceInfo?.contentType)
+    }
+
+    func chooseMedia(from result: Result<URL, Error>) {
+        guard case .success(let url) = result else {
+            if case .failure(let error) = result,
+               !((error as NSError).domain == NSCocoaErrorDomain && (error as NSError).code == NSUserCancelledError) {
+                ftlvUploadMessage = error.localizedDescription
+            }
+            return
+        }
+        let hasSecurityScope = url.startAccessingSecurityScopedResource()
+        Task {
+            do {
+                let kind = try await MediaConverter.inspect(url)
+                let state = MediaConversionState(sourceURL: url, hasSecurityScope: hasSecurityScope, kind: kind)
+                mediaConversion = state
+                refreshMediaPreview()
+            } catch {
+                if hasSecurityScope { url.stopAccessingSecurityScopedResource() }
+                ftlvUploadMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func closeMediaConversion() {
+        guard let state = mediaConversion else { return }
+        state.cancellation.cancel()
+        if state.hasSecurityScope { state.sourceURL.stopAccessingSecurityScopedResource() }
+        mediaConversion = nil
+    }
+
+    func refreshMediaPreview() {
+        guard let state = mediaConversion else { return }
+        let target = conversionTarget
+        Task {
+            do {
+                let image = try await MediaConverter.preview(
+                    state.sourceURL, kind: state.kind, target: target, framing: state.framing, startSecond: state.startSecond
+                )
+                guard mediaConversion?.id == state.id else { return }
+                mediaConversion?.preview = image
+            } catch {
+                mediaConversion?.message = error.localizedDescription
+            }
+        }
+    }
+
+    /// Converts the selected media, then either uploads it or saves it to `exportURL`.
+    func runMediaConversion(exportTo exportURL: URL? = nil) {
+        guard var state = mediaConversion, !state.isWorking else { return }
+        if let reason = conversionUnsupportedReason {
+            mediaConversion?.message = reason
+            return
+        }
+        if exportURL == nil {
+            guard isConnected, connectedDevice != nil else {
+                mediaConversion?.message = "Connect to a discovered fan before uploading."
+                return
+            }
+            guard !isUploadingFTLV else {
+                mediaConversion?.message = "Another upload is in progress."
+                return
+            }
+        }
+        state.isWorking = true
+        state.progress = 0
+        state.message = "Converting…"
+        mediaConversion = state
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SpinDisplayConversion-\(UUID().uuidString)", isDirectory: true)
+        let output = directory.appendingPathComponent(uploadName(for: state.sourceURL)).appendingPathExtension("ftlv")
+        let options = MediaConverter.Options(
+            framing: state.framing,
+            includeAudio: state.includeAudio,
+            startSecond: state.startSecond,
+            endSecond: state.endSecond,
+            holdLastFrame: state.holdLastFrame
+        )
+        let target = conversionTarget
+        let cancellation = state.cancellation
+        let id = state.id
+        let report: @Sendable (Double, String) -> Void = { [weak self] progress, message in
+            Task { @MainActor in
+                guard let self, self.mediaConversion?.id == id else { return }
+                self.mediaConversion?.progress = progress
+                self.mediaConversion?.message = message
+            }
+        }
+        Task {
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try await MediaConverter.convert(
+                        state.sourceURL, kind: state.kind, target: target, options: options, output: output,
+                        isCancelled: { cancellation.isCancelled },
+                        progress: report
+                    )
+                }.value
+                guard mediaConversion?.id == id else {
+                    try? FileManager.default.removeItem(at: directory)
+                    return
+                }
+                let summary = "\(result.frameCount) frame(s)\(result.fps.map { " at \($0) fps" } ?? "")\(result.hasAudio ? " with audio" : "")"
+                if let exportURL {
+                    if FileManager.default.fileExists(atPath: exportURL.path) {
+                        try FileManager.default.removeItem(at: exportURL)
+                    }
+                    try FileManager.default.moveItem(at: output, to: exportURL)
+                    try? FileManager.default.removeItem(at: directory)
+                    mediaConversion?.isWorking = false
+                    mediaConversion?.message = "Exported \(exportURL.lastPathComponent): \(summary)."
+                } else {
+                    let started = startUpload(of: output, validatingMessage: "Uploading converted media (\(summary))…") {
+                        try? FileManager.default.removeItem(at: directory)
+                    }
+                    if started { closeMediaConversion() } else { mediaConversion?.isWorking = false }
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                guard mediaConversion?.id == id else { return }
+                mediaConversion?.isWorking = false
+                mediaConversion?.message = error.localizedDescription
+            }
+        }
+    }
+
+    func exportMediaConversion() {
+        guard let state = mediaConversion else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "ftlv") ?? .data]
+        panel.nameFieldStringValue = uploadName(for: state.sourceURL) + ".ftlv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        runMediaConversion(exportTo: url)
+    }
+
+    /// The fan rejects duplicate names (status 2); like the original, pick an unused name instead.
+    private func uploadName(for source: URL) -> String {
+        var base = source.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { base = "media" }
+        while base.utf8.count > 90 { base.removeLast() }
+        let existing = Set(playlist.map(\.name))
+        var candidate = base
+        var counter = 1
+        while existing.contains(candidate) {
+            candidate = "\(base)(\(counter))"
+            counter += 1
+        }
+        return candidate
     }
 
     func deletePlaylistItem(at index: Int) {
@@ -552,16 +754,29 @@ final class DeviceViewModel: ObservableObject {
         }
     }
 
+    /// The original refuses Bluetooth changes on a fan that is in a sync group but is not its host.
+    private var bluetoothBlockedBySyncGroup: Bool {
+        guard let info = deviceInfo else { return false }
+        return info.groupNumber != 0 && info.syncFlag != 1
+    }
+
     func setBluetoothEnabled(_ isEnabled: Bool) {
         guard isConnected, let connection else {
             bluetoothMessage = "Connect to the fan before changing Bluetooth settings."
             connectionMessage = bluetoothMessage
             return
         }
+        guard !bluetoothBlockedBySyncGroup else {
+            bluetoothMessage = "This fan is in a sync group but is not its host, so it cannot use Bluetooth audio."
+            connectionMessage = bluetoothMessage
+            return
+        }
         do {
             try connection.setBluetoothEnabled(isEnabled)
             bluetoothEnabled = isEnabled
-            bluetoothMessage = "Bluetooth \(isEnabled ? "enable" : "disable") command sent. Pair/select the fan as your Mac's audio output to test."
+            bluetoothMessage = isEnabled
+                ? "Bluetooth enabled. Put your Bluetooth speaker in pairing mode, then press Search and connect."
+                : "Bluetooth disabled."
             connectionMessage = bluetoothMessage
         } catch {
             bluetoothMessage = error.localizedDescription
@@ -584,7 +799,30 @@ final class DeviceViewModel: ObservableObject {
         do {
             try connection.setBluetoothVolume(UInt8(level))
             bluetoothVolume = Double(level)
-            bluetoothMessage = "Volume \(level)/31 command sent. This changes the fan speaker's volume, not the Mac's output volume."
+            bluetoothMessage = "Volume \(level)/31 command sent to the fan's Bluetooth speaker output."
+            connectionMessage = bluetoothMessage
+        } catch {
+            bluetoothMessage = error.localizedDescription
+            connectionMessage = error.localizedDescription
+        }
+    }
+
+    /// Original "Search and connect" button (`BleVolumeSetting(2, 0)`): the fan searches for and pairs with
+    /// a nearby Bluetooth speaker. The fan is the audio source; it does not appear as a speaker to the Mac.
+    func searchForBluetoothSpeaker() {
+        guard isConnected, let connection else {
+            bluetoothMessage = "Connect to the fan before searching for a Bluetooth speaker."
+            connectionMessage = bluetoothMessage
+            return
+        }
+        guard !bluetoothBlockedBySyncGroup else {
+            bluetoothMessage = "This fan is in a sync group but is not its host, so it cannot use Bluetooth audio."
+            connectionMessage = bluetoothMessage
+            return
+        }
+        do {
+            try connection.searchForBluetoothSpeaker()
+            bluetoothMessage = "Search started. The fan connects to a nearby speaker in pairing mode; the app gets no confirmation, so listen for the speaker's pairing tone."
             connectionMessage = bluetoothMessage
         } catch {
             bluetoothMessage = error.localizedDescription
@@ -757,6 +995,9 @@ struct ContentView: View {
         .sheet(item: $model.fileEditor) { _ in
             FileEditorSheet(model: model)
         }
+        .sheet(item: $model.mediaConversion) { _ in
+            MediaConversionSheet(model: model)
+        }
         .confirmationDialog(
             "Delete all files on this fan?",
             isPresented: $model.showDeleteAllConfirmation,
@@ -886,7 +1127,7 @@ struct ContentView: View {
                                     Label("Repeat item", systemImage: "repeat")
                                 }
                                 .disabled(model.currentPlaylistIndex.map { !model.playlist.indices.contains($0) } ?? true)
-                                .help("Enables repeat for the current item, then starts it.")
+                                .help("Plays the current item, then sets it to loop (the original app's Cycleplay).")
                                 Button {
                                     model.skipPlaylist(by: 1)
                                 } label: {
@@ -977,9 +1218,14 @@ struct ContentView: View {
 
                     GroupBox("Upload media") {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Uploads existing .ftlv files only. Image/video conversion is not implemented.")
+                            Text("Convert an image, animated GIF, or video to the fan's format, or upload an existing .ftlv file.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if let reason = model.conversionUnsupportedReason {
+                                Text(reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
                             Text(model.connectedDevice == nil
                                 ? "Connect using a discovered fan so its device type can be checked."
                                 : "The file's device type and length fields are validated before sending.")
@@ -999,6 +1245,10 @@ struct ContentView: View {
                                         .lineLimit(2)
                                 }
                                 Spacer()
+                                Button("Convert image or video…") {
+                                    model.showMediaImporter = true
+                                }
+                                .disabled(model.isUploadingFTLV || model.mediaConversion != nil)
                                 Button("Choose FTLV file") {
                                     model.showFTLVImporter = true
                                 }
@@ -1010,6 +1260,12 @@ struct ContentView: View {
                             }
                         }
                         .padding(.vertical, 4)
+                    }
+                    .fileImporter(
+                        isPresented: $model.showMediaImporter,
+                        allowedContentTypes: [.image, .movie, .gif]
+                    ) {
+                        model.chooseMedia(from: $0)
                     }
                 }
             }
@@ -1126,13 +1382,21 @@ struct ContentView: View {
 
                 GroupBox("Bluetooth audio") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Toggle(
-                            "Enable fan Bluetooth audio",
-                            isOn: Binding(
-                                get: { model.bluetoothEnabled },
-                                set: model.setBluetoothEnabled
+                        Text("The fan plays video audio through an external Bluetooth speaker that it pairs with itself. It does not appear in the Mac's Bluetooth list.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        HStack {
+                            Toggle(
+                                "Turn on fan Bluetooth",
+                                isOn: Binding(
+                                    get: { model.bluetoothEnabled },
+                                    set: model.setBluetoothEnabled
+                                )
                             )
-                        )
+                            Spacer()
+                            Button("Search and connect speaker") { model.searchForBluetoothSpeaker() }
+                                .disabled(!model.isConnected || !model.bluetoothEnabled)
+                        }
                         HStack {
                             Text("Volume")
                             Slider(value: $model.bluetoothVolume, in: 0...31, step: 1)
@@ -1148,7 +1412,7 @@ struct ContentView: View {
                             Button("Set speaker volume") { model.setBluetoothVolume(model.bluetoothVolume) }
                                 .disabled(!model.isConnected)
                         }
-                        Text("To test: enable fan Bluetooth audio, then pair/select the fan in System Settings > Bluetooth and choose it in System Settings > Sound > Output. Play a short audio clip; adjust this fan volume and your Mac output volume separately.")
+                        Text("To test: turn on fan Bluetooth, put a Bluetooth speaker in pairing mode near the fan, press Search and connect, then play a video that was converted with audio.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Text(model.bluetoothMessage)
@@ -1251,6 +1515,7 @@ struct ContentView: View {
                         String(format: "%04d-%02d-%02d", info.factoryDate.year ?? 0, info.factoryDate.month ?? 0, info.factoryDate.day ?? 0)
                     )
                     infoRow("Display", "\(info.imageWidth)×\(info.imageSize) px, diameter \(info.diameter), up to \(info.maxFPS) fps")
+                    infoRow("Content type", "\(info.contentType)\(info.contentType == 3 ? " (LED transcoding; media conversion not yet supported)" : "")")
                     infoRow("Capacity", info.sdUsablePercent.map { "\($0.formatted())% usable" } ?? "—")
                     infoRow(
                         "Network",
@@ -1414,8 +1679,11 @@ private struct FileEditorSheet: View {
     }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<DeviceViewModel.FileEditorState, Value>) -> Binding<Value> {
-        Binding(
-            get: { model.fileEditor![keyPath: keyPath] },
+        // Bindings are only created while the sheet's state exists. SwiftUI may still read them after the
+        // state is cleared during dismissal, so fall back to the value captured here instead of unwrapping.
+        let fallback = model.fileEditor.map { $0[keyPath: keyPath] }
+        return Binding(
+            get: { model.fileEditor?[keyPath: keyPath] ?? fallback! },
             set: { model.fileEditor?[keyPath: keyPath] = $0 }
         )
     }
@@ -1464,5 +1732,132 @@ private struct FileEditorSheet: View {
             }
         }
         .opacity(value.wrappedValue.isEnabled ? 1 : 0.6)
+    }
+}
+
+/// Options and preview for converting an image, GIF, or video to FTLV.
+private struct MediaConversionSheet: View {
+    @ObservedObject var model: DeviceViewModel
+
+    var body: some View {
+        if let state = model.mediaConversion {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Convert Media").font(.title2.bold())
+                HStack(alignment: .top, spacing: 18) {
+                    preview(state)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(state.sourceURL.lastPathComponent)
+                            .font(.headline)
+                            .lineLimit(2)
+                        Text(describe(state.kind))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Picker("Framing", selection: binding(\.framing)) {
+                            Text("Fill circle").tag(MediaConverter.Framing.fill)
+                            Text("Fit whole image").tag(MediaConverter.Framing.fit)
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: state.framing) { _ in model.refreshMediaPreview() }
+                        if case .video(let duration, _, let hasAudio) = state.kind {
+                            let last = MediaConverter.availableSeconds(duration: duration, holdLastFrame: state.holdLastFrame)
+                            Stepper(value: binding(\.startSecond), in: 0...(last - 1)) {
+                                Text("Start: \(state.startSecond) s")
+                            }
+                            .onChange(of: state.startSecond) { start in
+                                if (model.mediaConversion?.endSecond ?? last) <= start { model.mediaConversion?.endSecond = start + 1 }
+                                model.refreshMediaPreview()
+                            }
+                            Stepper(value: Binding(
+                                get: { state.endSecond ?? last },
+                                set: { model.mediaConversion?.endSecond = $0 == last ? nil : $0 }
+                            ), in: (state.startSecond + 1)...last) {
+                                Text("End: \(state.endSecond ?? last) s")
+                            }
+                            Toggle("Hold last frame to finish the video", isOn: binding(\.holdLastFrame))
+                                .onChange(of: state.holdLastFrame) { hold in
+                                    let newLast = MediaConverter.availableSeconds(duration: duration, holdLastFrame: hold)
+                                    model.mediaConversion?.endSecond = nil
+                                    if (model.mediaConversion?.startSecond ?? 0) > newLast - 1 {
+                                        model.mediaConversion?.startSecond = newLast - 1
+                                    }
+                                }
+                                .help("On: the length rounds up to whole seconds and the final frame repeats. Off: the original app's behavior, which drops the last partial second.")
+                            Toggle("Include audio", isOn: binding(\.includeAudio))
+                                .disabled(!hasAudio)
+                        }
+                        Text(targetDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(width: 260)
+                }
+                if state.isWorking {
+                    ProgressView(value: state.progress)
+                }
+                if !state.message.isEmpty {
+                    Text(state.message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel", role: .cancel) { model.closeMediaConversion() }
+                        .keyboardShortcut(.cancelAction)
+                    Button("Export .ftlv…") { model.exportMediaConversion() }
+                        .disabled(state.isWorking || model.conversionUnsupportedReason != nil)
+                    Button("Convert & upload") { model.runMediaConversion() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(
+                            state.isWorking || !model.isConnected || model.connectedDevice == nil
+                                || model.isUploadingFTLV || model.conversionUnsupportedReason != nil
+                        )
+                }
+            }
+            .padding(20)
+            .frame(width: 560)
+        }
+    }
+
+    private var targetDescription: String {
+        let target = model.conversionTarget
+        let source = model.deviceInfo == nil ? "default fan settings" : "the connected fan"
+        return "Frames: \(target.imageSize)×\(target.imageSize) JPEG, up to \(target.maxFPS) fps (\(source)). Still images show for 10 s per loop."
+    }
+
+    private func preview(_ state: DeviceViewModel.MediaConversionState) -> some View {
+        ZStack {
+            Circle().fill(Color.black)
+            if let image = state.preview {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .clipShape(Circle())
+            } else {
+                ProgressView()
+            }
+        }
+        .frame(width: 220, height: 220)
+    }
+
+    private func describe(_ kind: MediaConverter.MediaKind) -> String {
+        switch kind {
+        case .image:
+            return "Still image"
+        case .animatedImage(let frames, let duration):
+            return "Animation: \(frames) frames, \(String(format: "%.1f", duration)) s"
+        case .video(let duration, let fps, let hasAudio):
+            return "Video: \(String(format: "%.1f", duration)) s at \(String(format: "%.2f", fps)) fps\(hasAudio ? ", with audio" : "")"
+        }
+    }
+
+    private func binding<Value>(_ keyPath: WritableKeyPath<DeviceViewModel.MediaConversionState, Value>) -> Binding<Value> {
+        // Bindings are only created while the sheet's state exists. SwiftUI may still read them after the
+        // state is cleared during dismissal, so fall back to the value captured here instead of unwrapping.
+        let fallback = model.mediaConversion.map { $0[keyPath: keyPath] }
+        return Binding(
+            get: { model.mediaConversion?[keyPath: keyPath] ?? fallback! },
+            set: { model.mediaConversion?[keyPath: keyPath] = $0 }
+        )
     }
 }

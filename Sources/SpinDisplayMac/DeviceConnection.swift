@@ -186,6 +186,10 @@ final class DeviceConnection {
         try sendPacket(SpinDisplayProtocol.bleVolumeRequest(control: isEnabled ? 1 : 0))
     }
 
+    func searchForBluetoothSpeaker() throws {
+        try sendPacket(SpinDisplayProtocol.bleVolumeRequest(control: 2))
+    }
+
     func setBluetoothVolume(_ volume: UInt8) throws {
         try sendPacket(SpinDisplayProtocol.bleVolumeRequest(control: 3, volume: volume))
     }

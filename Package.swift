@@ -7,12 +7,15 @@ let package = Package(
     products: [
         .executable(name: "SpinDisplayMac", targets: ["SpinDisplayMac"]),
         .executable(name: "SpinDisplayStatusCLI", targets: ["SpinDisplayStatusCLI"]),
-        .executable(name: "SpinDisplayMacProtocolTests", targets: ["SpinDisplayMacProtocolTests"])
+        .executable(name: "SpinDisplayMacProtocolTests", targets: ["SpinDisplayMacProtocolTests"]),
+        .executable(name: "SpinDisplayConvertCLI", targets: ["SpinDisplayConvertCLI"])
     ],
     targets: [
         .target(name: "SpinDisplayCore"),
-        .executableTarget(name: "SpinDisplayMac", dependencies: ["SpinDisplayCore"]),
+        .target(name: "SpinDisplayMedia", dependencies: ["SpinDisplayCore"]),
+        .executableTarget(name: "SpinDisplayMac", dependencies: ["SpinDisplayCore", "SpinDisplayMedia"]),
+        .executableTarget(name: "SpinDisplayConvertCLI", dependencies: ["SpinDisplayCore", "SpinDisplayMedia"]),
         .executableTarget(name: "SpinDisplayStatusCLI", dependencies: ["SpinDisplayCore"]),
-        .executableTarget(name: "SpinDisplayMacProtocolTests", dependencies: ["SpinDisplayCore"])
+        .executableTarget(name: "SpinDisplayMacProtocolTests", dependencies: ["SpinDisplayCore", "SpinDisplayMedia"])
     ]
 )

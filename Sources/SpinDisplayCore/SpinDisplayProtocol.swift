@@ -482,9 +482,10 @@ public enum SpinDisplayProtocol {
         return frame[4]
     }
 
+    /// Original `Button_Click_Delecte` stores `selectedIndex + 1`: `index` is zero-based, the packet one-based.
     public static func deleteFileRequest(index: Int) -> [UInt8]? {
         guard (0..<Int(UInt8.max)).contains(index) else { return nil }
-        return frame(command: deleteFileCommand, payload: [0, UInt8(index)])
+        return frame(command: deleteFileCommand, payload: [0, UInt8(index + 1)])
     }
 
     /// Original Settings "Format" button (`Send.DeleteFile(1, 0)`): deletes every file on the fan.
@@ -512,10 +513,11 @@ public enum SpinDisplayProtocol {
         frame(command: playControlCommand, payload: [control, index])
     }
 
+    /// Original `Button_Click_Loop` ("Cycleplay"): play the slot, then set it to loop.
     public static func repeatFileRequests(index: UInt8) -> [[UInt8]] {
         [
-            playControlRequest(control: 2, index: index),
-            playControlRequest(control: 1, index: index)
+            playControlRequest(control: 1, index: index),
+            playControlRequest(control: 2, index: index)
         ]
     }
 
